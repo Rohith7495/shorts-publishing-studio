@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: shorts-publishing-studio-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: VIDEO_UPLOAD_DIR
+        value: storage/uploads
+      - key: OAUTH_SESSION_DIR
+        value: storage/oauth_sessions
+      - key: FRAME_SAMPLE_SECONDS
+        value: "3"
+      - key: CORS_ORIGINS
+        value: '["https://shorts-publishing-studio.vercel.app"]'
+      - key: MAX_TITLE_COUNT
+        value: "2"
+      - key: UPLOAD_SESSION_TTL_SECONDS
+        value: "3600"
+      - key: OAUTH_SESSION_TTL_SECONDS
+        value: "2592000"
+      - key: FRONTEND_BASE_URL
+        value: https://shorts-publishing-studio.vercel.app
+      - key: BROWSER_SESSION_COOKIE_SAMESITE
+        value: none
+      - key: BROWSER_SESSION_COOKIE_SECURE
+        value: "true"
+      - key: GEMINI_VISION_MODEL
+        value: gemini-2.5-flash-lite
+      - key: GOOGLE_REDIRECT_URI
+        value: https://shorts-publishing-studio-api.onrender.com/api/auth/youtube/callback
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false

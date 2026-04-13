@@ -1,4 +1,4 @@
-api.your-backend-domain.example {
+rohithshortsapi.duckdns.org {
     encode gzip zstd
 
     header {

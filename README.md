@@ -119,7 +119,51 @@ The pipeline is intentionally split into visual and publish stages:
 
 ## Production deployment
 
-The repo includes ready-to-copy Oracle deployment templates:
+The simplest non-Oracle backend for this project is Render. The repo now includes:
+
+- `render.yaml`
+- `backend/Dockerfile`
+- `backend/.env.render.example`
+
+Render is a better fit than serverless functions here because the backend needs multipart uploads, temporary local file handling, OpenCV, and `ffmpeg` for optional pre-upload enhancements.
+
+### Deploy the backend on Render
+
+1. In Render, click `New +` and choose `Blueprint`.
+2. Connect the GitHub repo `Rohith7495/shorts-publishing-studio`.
+3. Render will detect `render.yaml` and create a web service named `shorts-publishing-studio-api`.
+4. During setup, enter your secret values for:
+   - `GEMINI_API_KEY`
+   - `GOOGLE_CLIENT_ID`
+   - `GOOGLE_CLIENT_SECRET`
+5. After the first deploy, open the Render service and copy its public URL.
+6. If the hostname is not exactly `https://shorts-publishing-studio-api.onrender.com`, update:
+   - `GOOGLE_REDIRECT_URI` in Render
+   - `NEXT_PUBLIC_API_BASE_URL` in Vercel
+   - the Google OAuth redirect URI in Google Cloud
+
+Use `backend/.env.render.example` as the reference for the Render environment variables.
+
+In Vercel, set:
+
+```bash
+NEXT_PUBLIC_API_BASE_URL=https://shorts-publishing-studio-api.onrender.com
+```
+
+In Google Auth Platform, set:
+
+- Authorized JavaScript origin: `https://shorts-publishing-studio.vercel.app`
+- Authorized redirect URI: `https://shorts-publishing-studio-api.onrender.com/api/auth/youtube/callback`
+
+Important notes for Render free web services:
+
+- Free services can spin down after inactivity, so the first request after idle can be slow.
+- This backend stores temporary uploads and OAuth session files on the local filesystem only. If the Render instance restarts, you may need to reconnect YouTube.
+- Uploaded videos are still deleted after successful YouTube upload, just like the local version.
+
+### Oracle alternative
+
+If you want an always-on VM later, the repo still includes ready-to-copy Oracle deployment templates:
 
 - `deploy/oracle/shorts-backend.service`
 - `deploy/oracle/Caddyfile`
@@ -143,8 +187,8 @@ cp .env.production.example .env
 
 Edit `backend/.env` and replace:
 
-- `https://your-project.vercel.app`
-- `https://api.your-backend-domain.example`
+- `https://shorts-publishing-studio.vercel.app`
+- `https://rohithshortsapi.duckdns.org`
 - `your_google_client_id_here`
 - `your_google_client_secret_here`
 - `your_gemini_api_key_here`
@@ -166,15 +210,15 @@ sudo nano /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-In `Caddyfile`, replace `api.your-backend-domain.example` with your real public backend hostname before you reload Caddy.
+The included `Caddyfile` is already set to `rohithshortsapi.duckdns.org`. If you change domains later, update that hostname before you reload Caddy.
 
 In Vercel, deploy `frontend/` and set:
 
 ```bash
-NEXT_PUBLIC_API_BASE_URL=https://api.your-backend-domain.example
+NEXT_PUBLIC_API_BASE_URL=https://rohithshortsapi.duckdns.org
 ```
 
 In Google Auth Platform, add the matching production values:
 
-- Authorized JavaScript origin: `https://your-project.vercel.app`
-- Authorized redirect URI: `https://api.your-backend-domain.example/api/auth/youtube/callback`
+- Authorized JavaScript origin: `https://shorts-publishing-studio.vercel.app`
+- Authorized redirect URI: `https://rohithshortsapi.duckdns.org/api/auth/youtube/callback`
