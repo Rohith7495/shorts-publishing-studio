@@ -49,16 +49,11 @@ export type YouTubeAuthStatus = {
   channel_id?: string | null;
 };
 
-export type VideoEnhancementOptions = {
-  visual_pop: boolean;
-  audio_cleanup: boolean;
-};
-
 export type YouTubePublishResponse = {
   video_id: string;
   video_url: string;
   studio_url: string;
   privacy_status: "private" | "unlisted" | "public";
+  publish_at?: string | null;
   deleted_local_upload: boolean;
-  applied_enhancements: string[];
 };

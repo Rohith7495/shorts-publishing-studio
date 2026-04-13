@@ -262,6 +262,7 @@ class YouTubeUploadService:
         description: str,
         tags: list[str],
         privacy_status: str,
+        publish_at: Optional[datetime] = None,
     ) -> dict[str, str]:
         build, media_file_upload = self._import_youtube_client_modules()
         youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
@@ -279,6 +280,9 @@ class YouTubeUploadService:
                 "selfDeclaredMadeForKids": False,
             },
         }
+        if publish_at is not None:
+            scheduled_publish_at = publish_at.astimezone(timezone.utc).replace(microsecond=0)
+            body["status"]["publishAt"] = scheduled_publish_at.isoformat().replace("+00:00", "Z")
 
         insert_request = youtube.videos().insert(
             part="snippet,status",

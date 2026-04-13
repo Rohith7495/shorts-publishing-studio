@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class VideoMetadata(BaseModel):
@@ -75,7 +76,27 @@ class YouTubePublishRequest(BaseModel):
     description: str = Field(min_length=1, max_length=5000)
     tags: list[str] = Field(default_factory=list)
     privacy_status: Literal["private", "unlisted", "public"] = "private"
+    publish_at: Optional[datetime] = None
     enhancements: VideoEnhancementOptions = Field(default_factory=VideoEnhancementOptions)
+
+    @field_validator("publish_at")
+    @classmethod
+    def normalize_publish_at(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("publish_at must include a timezone.")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def validate_schedule_rules(self) -> "YouTubePublishRequest":
+        if self.publish_at is None:
+            return self
+        if self.privacy_status != "private":
+            raise ValueError("Scheduled YouTube uploads must stay private until the publish time.")
+        if self.publish_at <= datetime.now(timezone.utc):
+            raise ValueError("publish_at must be in the future.")
+        return self
 
 
 class YouTubePublishResponse(BaseModel):
@@ -83,5 +104,6 @@ class YouTubePublishResponse(BaseModel):
     video_url: str
     studio_url: str
     privacy_status: Literal["private", "unlisted", "public"]
+    publish_at: Optional[datetime] = None
     deleted_local_upload: bool
     applied_enhancements: list[str] = Field(default_factory=list)

@@ -5,7 +5,6 @@ import { FormEvent, useEffect, useState, useTransition } from "react";
 import { API_BASE_URL } from "@/lib/api";
 import type {
   GenerationResponse,
-  VideoEnhancementOptions,
   YouTubeAuthStatus,
   YouTubePublishResponse,
 } from "@/lib/types";
@@ -15,7 +14,8 @@ type CopyState = {
   copied: boolean;
 };
 
-type PrivacyStatus = "private" | "unlisted" | "public";
+type PublishPrivacyStatus = "private" | "unlisted" | "public";
+type PublishMode = PublishPrivacyStatus | "scheduled";
 
 const DEFAULT_AUTH_STATUS: YouTubeAuthStatus = {
   connected: false,
@@ -23,10 +23,18 @@ const DEFAULT_AUTH_STATUS: YouTubeAuthStatus = {
   channel_id: null,
 };
 
-const DEFAULT_ENHANCEMENTS: VideoEnhancementOptions = {
-  visual_pop: false,
-  audio_cleanup: false,
-};
+function formatDateTimeLocalInput(date: Date) {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  const hours = `${date.getHours()}`.padStart(2, "0");
+  const minutes = `${date.getMinutes()}`.padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
+}
+
+function defaultScheduledAtValue() {
+  return formatDateTimeLocalInput(new Date(Date.now() + 60 * 60 * 1000));
+}
 
 export function UploadStudio() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -44,8 +52,8 @@ export function UploadStudio() {
   const [titleDraft, setTitleDraft] = useState("");
   const [descriptionDraft, setDescriptionDraft] = useState("");
   const [tagsDraft, setTagsDraft] = useState("");
-  const [privacyStatus, setPrivacyStatus] = useState<PrivacyStatus>("private");
-  const [enhancements, setEnhancements] = useState<VideoEnhancementOptions>(DEFAULT_ENHANCEMENTS);
+  const [publishMode, setPublishMode] = useState<PublishMode>("private");
+  const [scheduleAtDraft, setScheduleAtDraft] = useState("");
   const [isPending, startTransition] = useTransition();
 
   useEffect(() => {
@@ -171,8 +179,8 @@ export function UploadStudio() {
     setTitleDraft(payload.hook_titles[0]?.text ?? "");
     setDescriptionDraft(payload.descriptions[0]?.text ?? "");
     setTagsDraft(payload.hashtags.join(" "));
-    setPrivacyStatus("private");
-    setEnhancements(DEFAULT_ENHANCEMENTS);
+    setPublishMode("private");
+    setScheduleAtDraft("");
   }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -195,7 +203,8 @@ export function UploadStudio() {
     setTagsDraft("");
     setSelectedTitleIndex(0);
     setSelectedDescriptionIndex(0);
-    setEnhancements(DEFAULT_ENHANCEMENTS);
+    setPublishMode("private");
+    setScheduleAtDraft("");
   }
 
   function selectTitle(index: number) {
@@ -223,6 +232,15 @@ export function UploadStudio() {
 
     const returnTo = `${window.location.origin}${window.location.pathname}`;
     window.location.href = `${API_BASE_URL}/api/auth/youtube/start?return_to=${encodeURIComponent(returnTo)}`;
+  }
+
+  function handlePublishModeChange(nextMode: PublishMode) {
+    setPublishMode(nextMode);
+    if (nextMode === "scheduled") {
+      setScheduleAtDraft((current) => current || defaultScheduledAtValue());
+      return;
+    }
+    setScheduleAtDraft("");
   }
 
   async function disconnectYouTube() {
@@ -265,6 +283,29 @@ export function UploadStudio() {
       return;
     }
 
+    let publishAt: string | null = null;
+    let effectivePrivacyStatus: PublishPrivacyStatus = publishMode === "scheduled" ? "private" : publishMode;
+
+    if (publishMode === "scheduled") {
+      if (!scheduleAtDraft.trim()) {
+        setError("Choose the date and time when YouTube should publish this video.");
+        return;
+      }
+
+      const scheduledDate = new Date(scheduleAtDraft);
+      if (Number.isNaN(scheduledDate.getTime())) {
+        setError("Choose a valid schedule date and time.");
+        return;
+      }
+      if (scheduledDate.getTime() <= Date.now()) {
+        setError("The scheduled publish time must be in the future.");
+        return;
+      }
+
+      publishAt = scheduledDate.toISOString();
+      effectivePrivacyStatus = "private";
+    }
+
     setIsPublishing(true);
     setError(null);
     setNotice(null);
@@ -281,8 +322,8 @@ export function UploadStudio() {
           title: titleDraft.trim(),
           description: descriptionDraft.trim(),
           tags: parseTags(tagsDraft),
-          privacy_status: privacyStatus,
-          enhancements,
+          privacy_status: effectivePrivacyStatus,
+          publish_at: publishAt,
         }),
       });
 
@@ -302,9 +343,13 @@ export function UploadStudio() {
       const payload = (await response.json()) as YouTubePublishResponse;
       setPublishResult(payload);
       setNotice(
-        payload.deleted_local_upload
-          ? "Published to YouTube. The temporary local upload was deleted from the server."
-          : "Published to YouTube.",
+        payload.publish_at
+          ? payload.deleted_local_upload
+            ? "Scheduled on YouTube. The temporary local upload was deleted from the server."
+            : "Scheduled on YouTube."
+          : payload.deleted_local_upload
+            ? "Published to YouTube. The temporary local upload was deleted from the server."
+            : "Published to YouTube.",
       );
     } catch (publishError) {
       setError(
@@ -383,6 +428,14 @@ export function UploadStudio() {
     return date.toLocaleString();
   }
 
+  function formatScheduleSummary(value: string) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return "Choose a valid local date and time to schedule this upload.";
+    }
+    return `YouTube will keep this upload private until ${date.toLocaleString()}.`;
+  }
+
   const canPublish =
     Boolean(results?.upload_session_id) &&
     authStatus.connected &&
@@ -390,7 +443,8 @@ export function UploadStudio() {
     !isPublishing &&
     !isSubmitting &&
     titleDraft.trim().length > 0 &&
-    descriptionDraft.trim().length > 0;
+    descriptionDraft.trim().length > 0 &&
+    (publishMode !== "scheduled" || scheduleAtDraft.trim().length > 0);
 
   return (
     <main className="page-shell">
@@ -427,7 +481,7 @@ export function UploadStudio() {
           </div>
           <div className="stat-card">
             <span className="stat-label">Publish mode</span>
-            <strong>{privacyStatus}</strong>
+            <strong>{publishMode}</strong>
           </div>
         </div>
       </section>
@@ -633,59 +687,37 @@ export function UploadStudio() {
                       />
                     </label>
                     <label className="field-group">
-                      <span>Privacy</span>
+                      <span>Publish Mode</span>
                       <select
-                        value={privacyStatus}
-                        onChange={(event) => setPrivacyStatus(event.target.value as PrivacyStatus)}
+                        value={publishMode}
+                        onChange={(event) => handlePublishModeChange(event.target.value as PublishMode)}
                       >
                         <option value="private">Private</option>
                         <option value="unlisted">Unlisted</option>
                         <option value="public">Public</option>
+                        <option value="scheduled">Scheduled</option>
                       </select>
                     </label>
                   </div>
 
-                  <div className="field-group">
-                    <span>Enhance Video Before Upload</span>
-                    <div className="option-grid">
-                      <label className="toggle-card">
-                        <input
-                          type="checkbox"
-                          checked={enhancements.visual_pop}
-                          onChange={(event) =>
-                            setEnhancements((current) => ({
-                              ...current,
-                              visual_pop: event.target.checked,
-                            }))
-                          }
-                        />
-                        <div>
-                          <strong>Pop Look</strong>
-                          <p>Boost contrast, saturation, and sharpness before the YouTube upload.</p>
-                        </div>
-                      </label>
-                      <label className="toggle-card">
-                        <input
-                          type="checkbox"
-                          checked={enhancements.audio_cleanup}
-                          onChange={(event) =>
-                            setEnhancements((current) => ({
-                              ...current,
-                              audio_cleanup: event.target.checked,
-                            }))
-                          }
-                        />
-                        <div>
-                          <strong>Audio Cleanup</strong>
-                          <p>Reduce rumble and noise, then normalize loudness before upload.</p>
-                        </div>
-                      </label>
+                  {publishMode === "scheduled" ? (
+                    <div className="field-group">
+                      <span>Publish At</span>
+                      <input
+                        type="datetime-local"
+                        value={scheduleAtDraft}
+                        min={formatDateTimeLocalInput(new Date())}
+                        onChange={(event) => setScheduleAtDraft(event.target.value)}
+                      />
+                      <p className="section-caption">{formatScheduleSummary(scheduleAtDraft)}</p>
                     </div>
-                  </div>
+                  ) : null}
 
                   <div className="publish-meta">
                     <span className="meta-label">
-                      {authStatus.connected
+                      {publishMode === "scheduled"
+                        ? "Scheduled uploads are sent to YouTube as private until the publish time."
+                        : authStatus.connected
                         ? `Publishing to ${authStatus.channel_title ?? "your connected YouTube channel"}`
                         : "Connect YouTube to enable publishing"}
                     </span>
@@ -698,18 +730,26 @@ export function UploadStudio() {
                     disabled={!canPublish}
                     onClick={() => void publishToYouTube()}
                   >
-                    {isPublishing ? "Uploading To YouTube..." : "Publish To YouTube"}
+                    {isPublishing
+                      ? publishMode === "scheduled"
+                        ? "Scheduling On YouTube..."
+                        : "Uploading To YouTube..."
+                      : publishMode === "scheduled"
+                        ? "Schedule On YouTube"
+                        : "Publish To YouTube"}
                   </button>
                 </div>
 
                 {publishResult ? (
                   <article className="info-card success-card">
-                    <h3>Upload Complete</h3>
-                    <p>Your video was uploaded to YouTube and the temporary local upload was cleaned up.</p>
-                    {publishResult.applied_enhancements.length > 0 ? (
-                      <p>
-                        Applied enhancements: {publishResult.applied_enhancements.join(", ")}
-                      </p>
+                    <h3>{publishResult.publish_at ? "Upload Scheduled" : "Upload Complete"}</h3>
+                    <p>
+                      {publishResult.publish_at
+                        ? `Your video was uploaded to YouTube and scheduled for ${formatExpiry(publishResult.publish_at)}.`
+                        : "Your video was uploaded to YouTube and the temporary local upload was cleaned up."}
+                    </p>
+                    {publishResult.publish_at ? (
+                      <p>The video stays private on YouTube until the scheduled publish time arrives.</p>
                     ) : null}
                     <div className="link-row">
                       <a href={publishResult.video_url} target="_blank" rel="noreferrer">

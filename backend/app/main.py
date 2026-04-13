@@ -208,6 +208,7 @@ def publish_to_youtube(
             description=payload.description,
             tags=payload.tags,
             privacy_status=payload.privacy_status,
+            publish_at=payload.publish_at,
         )
     except YouTubeServiceError as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
@@ -220,6 +221,7 @@ def publish_to_youtube(
         video_url=publish_result["video_url"],
         studio_url=publish_result["studio_url"],
         privacy_status=payload.privacy_status,
+        publish_at=payload.publish_at,
         deleted_local_upload=deleted_local_upload,
         applied_enhancements=applied_enhancements,
     )
