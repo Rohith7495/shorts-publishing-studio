@@ -1,0 +1,17 @@
+.DS_Store
+node_modules/
+.next/
+dist/
+coverage/
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.local
+storage/
+backend/storage/
+
+
+.local-gh/
