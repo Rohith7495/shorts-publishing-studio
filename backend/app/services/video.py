@@ -34,6 +34,8 @@ class VideoProcessingService:
     MAX_FRAME_WIDTH = 1024
     JPEG_QUALITY = 82
     THUMBNAIL_SIZE = (1280, 720)
+    SHORTS_COVER_SIZE = (1080, 1920)
+    SHORTS_COVER_INTRO_SECONDS = 1.0
     THUMBNAIL_MAX_TEXT_WIDTH_RATIO = 0.72
 
     def __init__(
@@ -217,24 +219,44 @@ class VideoProcessingService:
 
         return frame_samples, [f"Extracted {len(frame_samples)} sampled frames for visual object analysis."]
 
+    @staticmethod
+    def uses_shorts_cover_preview(metadata: VideoMetadata) -> bool:
+        if metadata.width is None or metadata.height is None:
+            return False
+        return metadata.height > metadata.width
+
+    def supports_custom_thumbnail_upload(self, metadata: VideoMetadata) -> bool:
+        return not self.uses_shorts_cover_preview(metadata)
+
     def build_upload_expiry(self, record: StoredUploadSession) -> str:
         return record.expires_at.isoformat()
+
+    def get_thumbnail_frame_image_path(
+        self,
+        upload_session: StoredUploadSession,
+        preferred_timestamp_seconds: Optional[float] = None,
+    ) -> Path:
+        frame_sample = self._select_thumbnail_frame(upload_session, preferred_timestamp_seconds)
+        if frame_sample is None:
+            raise VideoProcessingServiceError("No sampled frames are available to build a cover preview.")
+        return Path(frame_sample.image_path)
 
     def render_thumbnail_preview(
         self,
         upload_session: StoredUploadSession,
         text: str,
         preferred_timestamp_seconds: Optional[float] = None,
+        visual_basis: Optional[str] = None,
+        frame_summary: Optional[str] = None,
     ) -> Path:
-        frame_sample = self._select_thumbnail_frame(upload_session, preferred_timestamp_seconds)
-        if frame_sample is None:
-            raise VideoProcessingServiceError("No sampled frames are available to build a thumbnail preview.")
-
-        destination = upload_session.workspace_dir / "thumbnail-preview.jpg"
-        self._compose_thumbnail_image(
-            source_image=Path(frame_sample.image_path),
+        source_image = self.get_thumbnail_frame_image_path(upload_session, preferred_timestamp_seconds)
+        destination = upload_session.workspace_dir / "cover-preview.jpg"
+        self._compose_cover_image(
+            source_image=source_image,
             text=text,
             destination=destination,
+            visual_basis=visual_basis,
+            frame_summary=frame_summary,
         )
         return destination
 
@@ -242,20 +264,19 @@ class VideoProcessingService:
         self,
         upload_session: StoredUploadSession,
         enhancements: VideoEnhancementOptions,
+        metadata: VideoMetadata,
     ) -> tuple[Path, list[str], list[str]]:
         notes: list[str] = []
         applied: list[str] = []
+        working_video_path = upload_session.video_path
 
-        if not enhancements.visual_pop and not enhancements.audio_cleanup:
-            return upload_session.video_path, ["Publishing the original uploaded video without pre-upload enhancements."], applied
-
-        ffmpeg_path = shutil.which("ffmpeg")
-        if not ffmpeg_path:
+        ffmpeg_path = self._find_ffmpeg()
+        if (enhancements.visual_pop or enhancements.audio_cleanup) and not ffmpeg_path:
             raise VideoProcessingServiceError(
-                "ffmpeg is required for pre-upload enhancements. Install ffmpeg on the backend machine or publish without enhancement toggles."
+                "ffmpeg is required for video preparation before upload. Install ffmpeg on the backend machine and try again."
             )
 
-        has_audio_stream = self._has_audio_stream(upload_session.video_path)
+        has_audio_stream = self._has_audio_stream(working_video_path)
         video_filters: list[str] = []
         audio_filters: list[str] = []
 
@@ -284,24 +305,125 @@ class VideoProcessingService:
             else:
                 notes.append("Audio cleanup was requested, but the upload does not include a detectable audio stream.")
 
-        if not applied:
-            return upload_session.video_path, notes or ["No compatible enhancements were applied; publishing the original upload."], applied
+        if video_filters or audio_filters:
+            output_path = upload_session.workspace_dir / "publish-enhanced.mp4"
+            command = [
+                ffmpeg_path,
+                "-y",
+                "-i",
+                str(working_video_path),
+                "-map",
+                "0:v:0",
+            ]
 
-        output_path = upload_session.workspace_dir / "publish-enhanced.mp4"
-        command = [
-            ffmpeg_path,
-            "-y",
-            "-i",
-            str(upload_session.video_path),
-            "-map",
-            "0:v:0",
-        ]
+            if video_filters:
+                command.extend(["-vf", ",".join(video_filters)])
 
-        if video_filters:
-            command.extend(["-vf", ",".join(video_filters)])
+            command.extend(
+                [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "20",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    "-map_metadata",
+                    "0",
+                ]
+            )
 
-        command.extend(
-            [
+            if has_audio_stream:
+                command.extend(["-map", "0:a?"])
+                if audio_filters:
+                    command.extend(["-af", ",".join(audio_filters), "-c:a", "aac", "-b:a", "192k"])
+                else:
+                    command.extend(["-c:a", "aac", "-b:a", "192k"])
+            else:
+                command.append("-an")
+
+            command.append(str(output_path))
+
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode != 0 or not output_path.exists():
+                raise VideoProcessingServiceError(
+                    f"ffmpeg failed while preparing the video for YouTube upload: {result.stderr.strip() or 'unknown ffmpeg error'}"
+                )
+
+            working_video_path = output_path
+
+        if not notes:
+            notes.append("Publishing the original uploaded video without pre-upload enhancements.")
+
+        return working_video_path, notes, applied
+
+    def _prepend_shorts_cover_intro(
+        self,
+        upload_session: StoredUploadSession,
+        source_video_path: Path,
+        metadata: VideoMetadata,
+        text: str,
+        preferred_timestamp_seconds: Optional[float],
+        ffmpeg_path: Optional[str],
+        visual_basis: Optional[str] = None,
+        frame_summary: Optional[str] = None,
+    ) -> Path:
+        if not ffmpeg_path:
+            raise VideoProcessingServiceError(
+                "ffmpeg is required to bake the Shorts cover into the first second of the upload."
+            )
+
+        cover_image_path = self.render_thumbnail_preview(
+            upload_session=upload_session,
+            text=text,
+            preferred_timestamp_seconds=preferred_timestamp_seconds,
+            visual_basis=visual_basis,
+            frame_summary=frame_summary,
+        )
+        target_width, target_height = self._target_publish_size(metadata)
+        fps = self._target_publish_fps(metadata.fps)
+        scale_filter = (
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
+            f"crop={target_width}:{target_height},setsar=1,format=yuv420p"
+        )
+        output_path = upload_session.workspace_dir / "publish-with-cover-intro.mp4"
+
+        if self._has_audio_stream(source_video_path):
+            filter_graph = (
+                f"[0:v]fps={fps},{scale_filter}[coverv];"
+                "[1:a]aformat=sample_rates=48000:channel_layouts=stereo[covera];"
+                f"[2:v]fps={fps},{scale_filter}[mainv];"
+                "[2:a]aformat=sample_rates=48000:channel_layouts=stereo[maina];"
+                "[coverv][covera][mainv][maina]concat=n=2:v=1:a=1[outv][outa]"
+            )
+            command = [
+                ffmpeg_path,
+                "-y",
+                "-loop",
+                "1",
+                "-framerate",
+                fps,
+                "-t",
+                str(self.SHORTS_COVER_INTRO_SECONDS),
+                "-i",
+                str(cover_image_path),
+                "-f",
+                "lavfi",
+                "-t",
+                str(self.SHORTS_COVER_INTRO_SECONDS),
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-i",
+                str(source_video_path),
+                "-filter_complex",
+                filter_graph,
+                "-map",
+                "[outv]",
+                "-map",
+                "[outa]",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -310,31 +432,63 @@ class VideoProcessingService:
                 "20",
                 "-pix_fmt",
                 "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
                 "-movflags",
                 "+faststart",
                 "-map_metadata",
-                "0",
+                "2",
+                str(output_path),
             ]
-        )
-
-        if has_audio_stream:
-            command.extend(["-map", "0:a?"])
-            if audio_filters:
-                command.extend(["-af", ",".join(audio_filters), "-c:a", "aac", "-b:a", "192k"])
-            else:
-                command.extend(["-c:a", "aac", "-b:a", "192k"])
         else:
-            command.append("-an")
-
-        command.append(str(output_path))
+            filter_graph = (
+                f"[0:v]fps={fps},{scale_filter}[coverv];"
+                f"[1:v]fps={fps},{scale_filter}[mainv];"
+                "[coverv][mainv]concat=n=2:v=1:a=0[outv]"
+            )
+            command = [
+                ffmpeg_path,
+                "-y",
+                "-loop",
+                "1",
+                "-framerate",
+                fps,
+                "-t",
+                str(self.SHORTS_COVER_INTRO_SECONDS),
+                "-i",
+                str(cover_image_path),
+                "-i",
+                str(source_video_path),
+                "-filter_complex",
+                filter_graph,
+                "-map",
+                "[outv]",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                "-movflags",
+                "+faststart",
+                "-map_metadata",
+                "1",
+                str(output_path),
+            ]
 
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode != 0 or not output_path.exists():
             raise VideoProcessingServiceError(
-                f"ffmpeg failed while preparing the video for YouTube upload: {result.stderr.strip() or 'unknown ffmpeg error'}"
+                "ffmpeg failed while baking the Shorts cover into the first second of the upload: "
+                f"{result.stderr.strip() or 'unknown ffmpeg error'}"
             )
 
-        return output_path, notes, applied
+        return output_path
 
     def _build_metadata_with_opencv(self, video_path: Path) -> Optional[Tuple[VideoMetadata, list[str]]]:
         cv2 = self._import_cv2()
@@ -373,11 +527,12 @@ class VideoProcessingService:
         video_path: Path,
         base_metadata: VideoMetadata,
     ) -> Optional[Tuple[VideoMetadata, list[str]]]:
-        if not shutil.which("ffprobe"):
+        ffprobe_path = self._find_ffprobe()
+        if not ffprobe_path:
             return None
 
         command = [
-            "ffprobe",
+            ffprobe_path,
             "-v",
             "error",
             "-select_streams",
@@ -463,72 +618,162 @@ class VideoProcessingService:
 
         return frame_samples
 
-    def _compose_thumbnail_image(self, source_image: Path, text: str, destination: Path) -> None:
-        image_module, image_color_module, image_draw_module, image_font_module = self._import_pillow_modules()
+    def _compose_cover_image(
+        self,
+        source_image: Path,
+        text: str,
+        destination: Path,
+        visual_basis: Optional[str] = None,
+        frame_summary: Optional[str] = None,
+    ) -> None:
+        (
+            image_module,
+            image_draw_module,
+            image_enhance_module,
+            image_filter_module,
+            image_font_module,
+        ) = self._import_pillow_modules()
 
         with image_module.open(source_image) as raw_image:
             base_image = raw_image.convert("RGB")
 
-        thumbnail = self._crop_to_thumbnail_canvas(image_module, base_image)
-        canvas = thumbnail.convert("RGBA")
+        context_text = " ".join(
+            part.strip() for part in [visual_basis or "", frame_summary or "", text] if part and part.strip()
+        )
+        theme = self._select_cover_theme(context_text)
+        badge_text = self._build_cover_badge_text(visual_basis, frame_summary)
+        use_shorts_cover = self._is_portrait_size(base_image.size)
+        target_size = self.SHORTS_COVER_SIZE if use_shorts_cover else self.THUMBNAIL_SIZE
+        canvas_image = self._crop_to_cover_canvas(image_module, base_image, target_size)
+        canvas_image = self._apply_cover_grade(
+            image_enhance_module=image_enhance_module,
+            image_filter_module=image_filter_module,
+            canvas_image=canvas_image,
+            context_text=context_text,
+            use_shorts_cover=use_shorts_cover,
+        )
+        canvas = canvas_image.convert("RGBA")
         overlay = image_module.new("RGBA", canvas.size, (0, 0, 0, 0))
+        overlay = self._apply_cover_lighting(
+            image_module=image_module,
+            image_draw_module=image_draw_module,
+            image_filter_module=image_filter_module,
+            overlay=overlay,
+            size=canvas.size,
+            theme=theme,
+            use_shorts_cover=use_shorts_cover,
+        )
         overlay_draw = image_draw_module.Draw(overlay)
         width, height = canvas.size
 
-        overlay_draw.rounded_rectangle(
-            (
-                int(width * 0.28),
+        if use_shorts_cover:
+            panel_box = (
+                int(width * 0.06),
+                int(height * 0.47),
+                int(width * 0.94),
+                int(height * 0.8),
+            )
+            accent_box = (
+                int(width * 0.1),
+                int(height * 0.51),
+                int(width * 0.62),
+                int(height * 0.535),
+            )
+            badge_box = (
+                int(width * 0.08),
+                int(height * 0.09),
+                int(width * 0.46),
+                int(height * 0.145),
+            )
+            panel_radius = 44
+            initial_font_size = 108
+            minimum_font_size = 68
+            max_text_width = int(width * 0.68)
+            line_gap = 18
+            text_center_y = int(height * 0.66)
+            stroke_width = 6
+            badge_font_size = 42
+        else:
+            panel_box = (
+                int(width * 0.2),
+                int(height * 0.54),
+                int(width * 0.8),
+                int(height * 0.9),
+            )
+            accent_box = (
+                int(width * 0.24),
                 int(height * 0.58),
-                int(width * 0.72),
-                int(height * 0.93),
-            ),
-            radius=36,
-            fill=(13, 13, 13, 150),
-        )
-        overlay_draw.rounded_rectangle(
-            (
-                int(width * 0.31),
+                int(width * 0.6),
                 int(height * 0.61),
-                int(width * 0.69),
-                int(height * 0.635),
-            ),
-            radius=12,
-            fill=(255, 107, 53, 230),
-        )
+            )
+            badge_box = (
+                int(width * 0.07),
+                int(height * 0.08),
+                int(width * 0.3),
+                int(height * 0.17),
+            )
+            panel_radius = 36
+            initial_font_size = 88
+            minimum_font_size = 56
+            max_text_width = int(width * 0.5)
+            line_gap = 12
+            text_center_y = int(height * 0.72)
+            stroke_width = 5
+            badge_font_size = 28
+
+        overlay_draw.rounded_rectangle(panel_box, radius=panel_radius, fill=theme["panel_fill"])
+        overlay_draw.rounded_rectangle(accent_box, radius=14, fill=theme["accent_fill"])
+        if badge_text:
+            overlay_draw.rounded_rectangle(badge_box, radius=18, fill=theme["badge_fill"])
 
         composed = image_module.alpha_composite(canvas, overlay)
         draw = image_draw_module.Draw(composed)
-        accent_color = image_color_module.getrgb("#fff8ef")
-        font = self._load_thumbnail_font(image_font_module, size=88)
+        accent_color = theme["text_fill"]
+        font = self._load_thumbnail_font(image_font_module, size=initial_font_size)
+        badge_font = self._load_thumbnail_font(image_font_module, size=badge_font_size)
         wrapped_lines = self._wrap_thumbnail_text(
             draw=draw,
             text=text,
             font=font,
-            max_width=int(width * 0.38),
+            max_width=max_text_width,
+            stroke_width=stroke_width,
         )
 
-        current_font_size = getattr(font, "size", 88)
-        while len(wrapped_lines) > 3 and current_font_size > 56:
+        current_font_size = getattr(font, "size", initial_font_size)
+        while len(wrapped_lines) > 3 and current_font_size > minimum_font_size:
             current_font_size -= 6
             font = self._load_thumbnail_font(image_font_module, size=current_font_size)
             wrapped_lines = self._wrap_thumbnail_text(
                 draw=draw,
                 text=text,
                 font=font,
-                max_width=int(width * 0.38),
+                max_width=max_text_width,
+                stroke_width=stroke_width,
             )
 
-        line_gap = 12
         line_heights = []
         for line in wrapped_lines:
-            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=5)
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
             line_heights.append(max(1, bbox[3] - bbox[1]))
         total_height = sum(line_heights) + line_gap * max(0, len(wrapped_lines) - 1)
-        current_y = int(height * 0.76 - total_height / 2)
+        current_y = int(text_center_y - total_height / 2)
         center_x = int(width * 0.5)
 
+        if badge_text:
+            badge_bbox = draw.textbbox((0, 0), badge_text, font=badge_font)
+            badge_width = max(1, badge_bbox[2] - badge_bbox[0])
+            badge_height = max(1, badge_bbox[3] - badge_bbox[1])
+            badge_x = badge_box[0] + max(16, int((badge_box[2] - badge_box[0] - badge_width) / 2))
+            badge_y = badge_box[1] + max(10, int((badge_box[3] - badge_box[1] - badge_height) / 2))
+            draw.text(
+                (badge_x, badge_y),
+                badge_text,
+                font=badge_font,
+                fill=theme["badge_text_fill"],
+            )
+
         for index, line in enumerate(wrapped_lines):
-            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=5)
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
             line_width = max(1, bbox[2] - bbox[0])
             x_position = center_x - int(line_width / 2)
             draw.text(
@@ -536,16 +781,200 @@ class VideoProcessingService:
                 line,
                 font=font,
                 fill=accent_color,
-                stroke_width=5,
-                stroke_fill=(19, 17, 33),
+                stroke_width=stroke_width,
+                stroke_fill=theme["stroke_fill"],
             )
             current_y += line_heights[index] + line_gap
 
         destination.parent.mkdir(parents=True, exist_ok=True)
         composed.convert("RGB").save(destination, format="JPEG", quality=92, optimize=True)
 
-    def _crop_to_thumbnail_canvas(self, image_module: Any, source_image: Any) -> Any:
-        target_width, target_height = self.THUMBNAIL_SIZE
+    def _apply_cover_grade(
+        self,
+        image_enhance_module: Any,
+        image_filter_module: Any,
+        canvas_image: Any,
+        context_text: str,
+        use_shorts_cover: bool,
+    ) -> Any:
+        lower_context = context_text.lower()
+        contrast = 1.22 if any(keyword in lower_context for keyword in ("tesla", "car", "drive", "tech", "screen")) else 1.16
+        color = 1.2 if "night" in lower_context else 1.14
+        brightness = 1.03 if use_shorts_cover else 1.02
+        sharpness = 1.3 if use_shorts_cover else 1.22
+
+        enhanced = image_enhance_module.Contrast(canvas_image).enhance(contrast)
+        enhanced = image_enhance_module.Color(enhanced).enhance(color)
+        enhanced = image_enhance_module.Brightness(enhanced).enhance(brightness)
+        enhanced = image_enhance_module.Sharpness(enhanced).enhance(sharpness)
+        return enhanced.filter(image_filter_module.UnsharpMask(radius=2, percent=135, threshold=2))
+
+    def _apply_cover_lighting(
+        self,
+        image_module: Any,
+        image_draw_module: Any,
+        image_filter_module: Any,
+        overlay: Any,
+        size: tuple[int, int],
+        theme: dict[str, tuple[int, ...]],
+        use_shorts_cover: bool,
+    ) -> Any:
+        width, height = size
+        glow_overlay = image_module.new("RGBA", size, (0, 0, 0, 0))
+        glow_draw = image_draw_module.Draw(glow_overlay)
+        primary_glow = (
+            int(width * -0.08),
+            int(height * (0.02 if use_shorts_cover else 0.08)),
+            int(width * 0.66),
+            int(height * 0.5),
+        )
+        secondary_glow = (
+            int(width * 0.5),
+            int(height * 0.02),
+            int(width * 1.06),
+            int(height * (0.34 if use_shorts_cover else 0.42)),
+        )
+        glow_draw.ellipse(primary_glow, fill=theme["glow_primary"])
+        glow_draw.ellipse(secondary_glow, fill=theme["glow_secondary"])
+        glow_overlay = glow_overlay.filter(image_filter_module.GaussianBlur(radius=max(28, width // 9)))
+        overlay = image_module.alpha_composite(overlay, glow_overlay)
+
+        top_gradient = self._build_vertical_gradient(
+            image_module=image_module,
+            size=size,
+            color=theme["top_tint"],
+            start_alpha=110,
+            end_alpha=0,
+            from_top=True,
+        )
+        bottom_gradient = self._build_vertical_gradient(
+            image_module=image_module,
+            size=size,
+            color=theme["bottom_shade"],
+            start_alpha=210 if use_shorts_cover else 195,
+            end_alpha=0,
+            from_top=False,
+        )
+        overlay = image_module.alpha_composite(overlay, top_gradient)
+        overlay = image_module.alpha_composite(overlay, bottom_gradient)
+        return overlay
+
+    def _build_vertical_gradient(
+        self,
+        image_module: Any,
+        size: tuple[int, int],
+        color: tuple[int, int, int],
+        start_alpha: int,
+        end_alpha: int,
+        from_top: bool,
+    ) -> Any:
+        width, height = size
+        mask = image_module.new("L", (1, height))
+        pixels = mask.load()
+
+        for y in range(height):
+            progress = y / max(1, height - 1)
+            if not from_top:
+                progress = 1 - progress
+            alpha = int(start_alpha + (end_alpha - start_alpha) * progress)
+            pixels[0, y] = max(0, min(255, alpha))
+
+        mask = mask.resize((width, height))
+        gradient = image_module.new("RGBA", size, (*color, 0))
+        gradient.putalpha(mask)
+        return gradient
+
+    def _select_cover_theme(self, context_text: str) -> dict[str, tuple[int, ...]]:
+        lower_context = context_text.lower()
+
+        if any(keyword in lower_context for keyword in ("tesla", "car", "drive", "driving", "navigation", "traffic", "dashboard", "screen", "tech", "technology", "ev")):
+            return {
+                "panel_fill": (8, 14, 20, 182),
+                "accent_fill": (255, 120, 44, 235),
+                "badge_fill": (29, 197, 224, 228),
+                "text_fill": (255, 248, 238),
+                "badge_text_fill": (7, 24, 31),
+                "stroke_fill": (14, 18, 24),
+                "glow_primary": (255, 120, 44, 142),
+                "glow_secondary": (29, 197, 224, 108),
+                "top_tint": (18, 31, 44),
+                "bottom_shade": (4, 6, 11),
+            }
+
+        if any(keyword in lower_context for keyword in ("food", "kitchen", "recipe", "restaurant", "cook", "drink")):
+            return {
+                "panel_fill": (24, 12, 10, 178),
+                "accent_fill": (255, 91, 52, 235),
+                "badge_fill": (255, 196, 74, 224),
+                "text_fill": (255, 248, 236),
+                "badge_text_fill": (56, 23, 5),
+                "stroke_fill": (26, 11, 8),
+                "glow_primary": (255, 91, 52, 148),
+                "glow_secondary": (255, 196, 74, 110),
+                "top_tint": (46, 19, 10),
+                "bottom_shade": (14, 7, 5),
+            }
+
+        if any(keyword in lower_context for keyword in ("travel", "nature", "outdoor", "beach", "mountain", "lifestyle", "street", "city")):
+            return {
+                "panel_fill": (12, 18, 14, 176),
+                "accent_fill": (255, 170, 54, 235),
+                "badge_fill": (132, 209, 84, 224),
+                "text_fill": (255, 249, 240),
+                "badge_text_fill": (12, 33, 16),
+                "stroke_fill": (13, 18, 14),
+                "glow_primary": (255, 170, 54, 142),
+                "glow_secondary": (132, 209, 84, 108),
+                "top_tint": (26, 40, 24),
+                "bottom_shade": (6, 10, 8),
+            }
+
+        return {
+            "panel_fill": (16, 14, 14, 182),
+            "accent_fill": (255, 122, 58, 235),
+            "badge_fill": (255, 216, 92, 225),
+            "text_fill": (255, 248, 240),
+            "badge_text_fill": (46, 29, 6),
+            "stroke_fill": (18, 14, 12),
+            "glow_primary": (255, 122, 58, 145),
+            "glow_secondary": (255, 216, 92, 108),
+            "top_tint": (40, 28, 18),
+            "bottom_shade": (8, 7, 6),
+        }
+
+    def _build_cover_badge_text(self, visual_basis: Optional[str], frame_summary: Optional[str]) -> str:
+        context = " ".join(part for part in [visual_basis or "", frame_summary or ""] if part).lower()
+
+        keyword_badges = [
+            (("tesla",), "TESLA POV"),
+            (("self-driving", "autonomous"), "AUTO TEST"),
+            (("navigation", "route", "traffic"), "LIVE ROUTE"),
+            (("screen", "dashboard"), "ON SCREEN"),
+            (("reaction", "surprise"), "REAL REACTION"),
+            (("watch",), "WATCH CLOSE"),
+        ]
+
+        for keywords, badge in keyword_badges:
+            if any(keyword in context for keyword in keywords):
+                return badge
+
+        words: list[str] = []
+        for raw_word in context.upper().split():
+            cleaned = "".join(character for character in raw_word if character.isalnum())
+            if len(cleaned) < 4 or cleaned in {"THIS", "WITH", "FROM", "THERE", "WHILE", "ABOUT"}:
+                continue
+            if cleaned not in words:
+                words.append(cleaned)
+            if len(words) == 2:
+                break
+
+        if words:
+            return " ".join(words)
+
+        return "WATCH CLOSE"
+
+    def _crop_to_cover_canvas(self, image_module: Any, source_image: Any, target_size: tuple[int, int]) -> Any:
+        target_width, target_height = target_size
         target_ratio = target_width / target_height
         source_width, source_height = source_image.size
         source_ratio = source_width / source_height if source_height else target_ratio
@@ -558,7 +987,10 @@ class VideoProcessingService:
             bottom = source_height
         else:
             crop_height = int(source_width / target_ratio)
-            top_bias = 0.38 if source_height > source_width else 0.5
+            if target_height > target_width:
+                top_bias = 0.3
+            else:
+                top_bias = 0.38 if source_height > source_width else 0.5
             top = max(0, min(source_height - crop_height, int((source_height - crop_height) * top_bias)))
             left = 0
             right = source_width
@@ -567,12 +999,18 @@ class VideoProcessingService:
         cropped = source_image.crop((left, top, right, bottom))
         return cropped.resize((target_width, target_height), image_module.Resampling.LANCZOS)
 
+    @staticmethod
+    def _is_portrait_size(size: tuple[int, int]) -> bool:
+        width, height = size
+        return height > width
+
     def _wrap_thumbnail_text(
         self,
         draw: Any,
         text: str,
         font: Any,
         max_width: int,
+        stroke_width: int,
     ) -> list[str]:
         words = text.strip().split()
         if not words:
@@ -583,7 +1021,7 @@ class VideoProcessingService:
 
         for word in words[1:]:
             candidate = f"{current} {word}"
-            bbox = draw.textbbox((0, 0), candidate, font=font, stroke_width=5)
+            bbox = draw.textbbox((0, 0), candidate, font=font, stroke_width=stroke_width)
             if bbox[2] <= max_width:
                 current = candidate
                 continue
@@ -610,6 +1048,25 @@ class VideoProcessingService:
 
         return image_font_module.load_default()
 
+    def _target_publish_size(self, metadata: VideoMetadata) -> tuple[int, int]:
+        fallback_width, fallback_height = self.SHORTS_COVER_SIZE
+        width = metadata.width if metadata.width and metadata.width > 1 else fallback_width
+        height = metadata.height if metadata.height and metadata.height > 1 else fallback_height
+        return self._normalize_even_dimension(width, fallback_width), self._normalize_even_dimension(height, fallback_height)
+
+    @staticmethod
+    def _target_publish_fps(raw_fps: Optional[float]) -> str:
+        fps = raw_fps if raw_fps and raw_fps > 0 else 30.0
+        fps = max(24.0, min(60.0, round(float(fps), 2)))
+        return f"{fps:g}"
+
+    @staticmethod
+    def _normalize_even_dimension(value: int, fallback: int) -> int:
+        normalized = int(value) if value and value > 1 else fallback
+        if normalized % 2 != 0:
+            normalized -= 1
+        return max(2, normalized)
+
     @staticmethod
     def _parse_fps(raw_fps: Optional[str]) -> Optional[float]:
         if not raw_fps:
@@ -631,7 +1088,7 @@ class VideoProcessingService:
 
     @staticmethod
     def _has_audio_stream(video_path: Path) -> bool:
-        ffprobe_path = shutil.which("ffprobe")
+        ffprobe_path = VideoProcessingService._find_ffprobe()
         if not ffprobe_path:
             return False
 
@@ -659,6 +1116,40 @@ class VideoProcessingService:
         return bool(payload.get("streams"))
 
     @staticmethod
+    def _find_ffmpeg() -> Optional[str]:
+        return VideoProcessingService._find_binary(
+            "ffmpeg",
+            [
+                "/opt/homebrew/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                "/usr/bin/ffmpeg",
+            ],
+        )
+
+    @staticmethod
+    def _find_ffprobe() -> Optional[str]:
+        return VideoProcessingService._find_binary(
+            "ffprobe",
+            [
+                "/opt/homebrew/bin/ffprobe",
+                "/usr/local/bin/ffprobe",
+                "/usr/bin/ffprobe",
+            ],
+        )
+
+    @staticmethod
+    def _find_binary(binary_name: str, fallbacks: list[str]) -> Optional[str]:
+        resolved = shutil.which(binary_name)
+        if resolved:
+            return resolved
+
+        for candidate in fallbacks:
+            if Path(candidate).exists():
+                return candidate
+
+        return None
+
+    @staticmethod
     def _import_cv2() -> Optional[Any]:
         try:
             import cv2  # type: ignore
@@ -667,14 +1158,14 @@ class VideoProcessingService:
         return cv2
 
     @staticmethod
-    def _import_pillow_modules() -> tuple[Any, Any, Any, Any]:
+    def _import_pillow_modules() -> tuple[Any, Any, Any, Any, Any]:
         try:
-            from PIL import Image, ImageColor, ImageDraw, ImageFont  # type: ignore
+            from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont  # type: ignore
         except ImportError as error:
             raise VideoProcessingServiceError(
                 "Pillow is required for custom thumbnail generation. Install it with `pip install -r requirements.txt`."
             ) from error
-        return Image, ImageColor, ImageDraw, ImageFont
+        return Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
     def _resize_frame_if_needed(self, cv2: Any, frame: Any) -> Any:
         height, width = frame.shape[:2]

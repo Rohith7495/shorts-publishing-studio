@@ -35,14 +35,11 @@ export type GenerationResponse = {
   hook_titles: HookTitleCandidate[];
   descriptions: DescriptionCandidate[];
   hashtags: string[];
-  thumbnail_text: string;
-  thumbnail_timestamp_seconds?: number | null;
   first_comment_text: string;
   detected_objects: DetectedObject[];
   frame_insights: FrameInsight[];
   upload_session_id: string;
   upload_expires_at: string;
-  thumbnail_preview_path: string;
   metadata: VideoMetadata;
   processing_notes: string[];
 };
@@ -59,9 +56,28 @@ export type YouTubePublishResponse = {
   studio_url: string;
   privacy_status: "private" | "unlisted" | "public";
   publish_at?: string | null;
-  thumbnail_uploaded: boolean;
   first_comment_posted: boolean;
   first_comment_id?: string | null;
   deleted_local_upload: boolean;
+  applied_enhancements?: string[];
   publish_notes: string[];
+};
+
+export type YouTubePublishJobStartResponse = {
+  job_id: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+};
+
+export type YouTubePublishJobStatusResponse = {
+  job_id: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+  stage: string;
+  detail?: string | null;
+  progress_percent?: number | null;
+  uploaded_bytes?: number | null;
+  total_bytes?: number | null;
+  remaining_seconds?: number | null;
+  elapsed_ms: number;
+  result?: YouTubePublishResponse | null;
+  error?: string | null;
 };

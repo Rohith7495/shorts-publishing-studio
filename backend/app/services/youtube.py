@@ -4,7 +4,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 
@@ -264,6 +264,7 @@ class YouTubeUploadService:
         tags: list[str],
         privacy_status: str,
         publish_at: Optional[datetime] = None,
+        progress_callback: Optional[Callable[[dict[str, float | int]], None]] = None,
     ) -> dict[str, str]:
         build, media_file_upload = self._import_youtube_client_modules()
         youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
@@ -294,13 +295,25 @@ class YouTubeUploadService:
         response = None
         try:
             while response is None:
-                _, response = insert_request.next_chunk()
+                status, response = insert_request.next_chunk()
+                if progress_callback is not None and status is not None:
+                    progress_callback(self._build_upload_progress(status, video_path.stat().st_size))
         except Exception as error:
             raise YouTubeServiceError(f"YouTube upload failed: {error}") from error
 
         video_id = response.get("id")
         if not video_id:
             raise YouTubeServiceError("YouTube did not return a video ID after upload.")
+
+        if progress_callback is not None:
+            total_bytes = video_path.stat().st_size
+            progress_callback(
+                {
+                    "uploaded_bytes": total_bytes,
+                    "total_bytes": total_bytes,
+                    "progress_percent": 100.0,
+                }
+            )
 
         return {
             "video_id": str(video_id),
@@ -376,6 +389,28 @@ class YouTubeUploadService:
             normalized.append(cleaned)
 
         return normalized[:15]
+
+    @staticmethod
+    def _build_upload_progress(status: Any, fallback_total_size: int) -> dict[str, float | int]:
+        uploaded_bytes = int(getattr(status, "resumable_progress", 0) or 0)
+        total_size = int(getattr(status, "total_size", 0) or 0) or fallback_total_size
+
+        progress_percent: Optional[float] = None
+        progress_method = getattr(status, "progress", None)
+        if callable(progress_method):
+            try:
+                progress_percent = float(progress_method()) * 100
+            except Exception:
+                progress_percent = None
+
+        if progress_percent is None and total_size > 0:
+            progress_percent = (uploaded_bytes / total_size) * 100
+
+        return {
+            "uploaded_bytes": uploaded_bytes,
+            "total_bytes": total_size,
+            "progress_percent": round(max(0.0, min(100.0, progress_percent or 0.0)), 1),
+        }
 
     @staticmethod
     def _get_authenticated_channel_id(youtube: Any) -> str:

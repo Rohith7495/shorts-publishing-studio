@@ -295,7 +295,7 @@ select {
 
 .results-topline {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 14px;
   align-items: end;
 }
@@ -376,6 +376,60 @@ select {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.progress-card {
+  display: grid;
+  gap: 12px;
+}
+
+.progress-list {
+  display: grid;
+  gap: 10px;
+}
+
+.progress-step {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: start;
+  padding: 12px 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(23, 19, 33, 0.08);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.progress-step strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.progress-step p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.progress-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  margin-top: 4px;
+  background: rgba(23, 19, 33, 0.16);
+}
+
+.progress-step-active {
+  border-color: rgba(255, 107, 53, 0.28);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.94), rgba(255, 232, 212, 0.86));
+}
+
+.progress-step-active .progress-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 6px rgba(255, 107, 53, 0.16);
+}
+
+.progress-step-complete .progress-dot {
+  background: #4b6858;
 }
 
 .checkbox-row {
@@ -471,6 +525,14 @@ select {
   aspect-ratio: 4 / 5;
 }
 
+.thumbnail-preview-frame-portrait {
+  aspect-ratio: 9 / 16;
+}
+
+.thumbnail-preview-frame-feed {
+  aspect-ratio: 4 / 5;
+}
+
 .thumbnail-preview-mobile-image {
   object-position: center center;
 }
@@ -494,6 +556,13 @@ select {
   box-shadow:
     0 0 0 999px rgba(23, 19, 33, 0.14),
     inset 0 0 0 1px rgba(23, 19, 33, 0.08);
+}
+
+.thumbnail-safe-crop-guide-portrait::after {
+  top: 14%;
+  bottom: 14%;
+  left: 10%;
+  right: 10%;
 }
 
 .publish-meta {

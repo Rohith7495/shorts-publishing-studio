@@ -34,34 +34,22 @@ class VideoGenerationPipeline:
             max_titles=self.max_title_count,
             max_hashtags=self.max_hashtag_count,
         )
-        self.video_service.render_thumbnail_preview(
-            upload_session=stored_upload,
-            text=analysis.thumbnail_text,
-            preferred_timestamp_seconds=analysis.thumbnail_timestamp_seconds,
-        )
-
         return GenerationResponse(
             category=analysis.category,
             visual_basis=analysis.visual_basis,
             hook_titles=analysis.hook_titles,
             descriptions=analysis.descriptions,
             hashtags=analysis.hashtags,
-            thumbnail_text=analysis.thumbnail_text,
-            thumbnail_timestamp_seconds=analysis.thumbnail_timestamp_seconds,
             first_comment_text=analysis.first_comment_text,
             detected_objects=analysis.detected_objects,
             frame_insights=analysis.frame_insights,
             upload_session_id=stored_upload.upload_session_id,
             upload_expires_at=self.video_service.build_upload_expiry(stored_upload),
-            thumbnail_preview_path=f"/api/uploads/{stored_upload.upload_session_id}/thumbnail-preview",
             metadata=metadata,
             processing_notes=[
                 *metadata_notes,
                 *frame_notes,
                 *analysis_notes,
-                f"Generated an automatic thumbnail preview from the sampled frame near {analysis.thumbnail_timestamp_seconds:.2f}s."
-                if analysis.thumbnail_timestamp_seconds is not None
-                else "Generated an automatic thumbnail preview from the sampled frames.",
                 "The uploaded video is stored only temporarily and will be deleted after a successful YouTube upload or session expiry.",
             ],
         )

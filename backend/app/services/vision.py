@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+from io import BytesIO
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from app.prompts import VISION_SYSTEM_PROMPT, build_visual_user_prompt
-from app.schemas import FrameInsight, FrameSample, VisionModelOutput
+from app.schemas import CoverTextCandidate, FrameInsight, FrameSample, VisionModelOutput
 
 
 TITLE_MAX_LENGTH = 100
@@ -17,6 +18,7 @@ MAX_TITLE_TAGS = 3
 MAX_SUFFIX_CANDIDATE_TAGS = 6
 DESCRIPTION_MAX_HASHTAGS = 5
 THUMBNAIL_TEXT_MAX_LENGTH = 42
+COVER_TEXT_OPTION_COUNT = 3
 HASHTAG_PATTERN = re.compile(r"#[A-Za-z0-9_]+")
 WHITESPACE_PATTERN = re.compile(r"\s+")
 SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+")
@@ -47,9 +49,10 @@ class GeminiVisionServiceError(RuntimeError):
 
 
 class GeminiVisionService:
-    def __init__(self, api_key: Optional[str], model_name: str) -> None:
+    def __init__(self, api_key: Optional[str], model_name: str, image_model_name: Optional[str] = None) -> None:
         self.api_key = api_key
         self.model_name = model_name
+        self.image_model_name = image_model_name or ""
         self._client: Optional[Any] = None
         self._types_module: Optional[Any] = None
 
@@ -99,6 +102,53 @@ class GeminiVisionService:
             "Descriptions were formatted into hook, context, CTA, and hashtag lines for YouTube Shorts.",
         ]
         return normalized, notes
+
+    def generate_cover_source_image(
+        self,
+        reference_image_path: Path,
+        destination_path: Path,
+        cover_text: str,
+        visual_basis: str,
+        frame_summary: str,
+        width: Optional[int],
+        height: Optional[int],
+    ) -> Path:
+        client, types_module = self._get_client_and_types()
+        prompt = self._build_cover_image_prompt(
+            cover_text=cover_text,
+            visual_basis=visual_basis,
+            frame_summary=frame_summary,
+            width=width,
+            height=height,
+        )
+
+        try:
+            response = client.models.generate_content(
+                model=self.image_model_name,
+                contents=[
+                    prompt,
+                    self._part_from_path(types_module, reference_image_path),
+                ],
+                config={
+                    "response_modalities": ["TEXT", "IMAGE"],
+                },
+            )
+        except Exception as error:
+            raise GeminiVisionServiceError(f"Gemini image generation failed: {error}") from error
+
+        image_bytes = self._extract_generated_image_bytes(response)
+        if image_bytes is None:
+            raise GeminiVisionServiceError("Gemini image generation did not return an image.")
+
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        image_module = self._import_pillow_image_module()
+        try:
+            with image_module.open(BytesIO(image_bytes)) as generated_image:
+                generated_image.convert("RGB").save(destination_path, format="JPEG", quality=94, optimize=True)
+        except Exception as error:
+            raise GeminiVisionServiceError(f"Gemini returned an unreadable image payload: {error}") from error
+
+        return destination_path
 
     def _get_client_and_types(self) -> tuple[Any, Any]:
         if self._client is not None and self._types_module is not None:
@@ -157,11 +207,6 @@ class GeminiVisionService:
             output.descriptions,
             output.visual_basis,
             output.hashtags,
-        )
-        output.thumbnail_text = self._normalize_thumbnail_text(output.thumbnail_text, output.visual_basis)
-        output.thumbnail_timestamp_seconds = self._normalize_thumbnail_timestamp(
-            output.thumbnail_timestamp_seconds,
-            frame_samples,
         )
         output.first_comment_text = self._normalize_first_comment(output.first_comment_text, output.visual_basis)
         output.detected_objects = self._normalize_detected_objects(output.detected_objects)
@@ -270,6 +315,60 @@ class GeminiVisionService:
             normalized = normalized[:THUMBNAIL_TEXT_MAX_LENGTH].rsplit(" ", 1)[0].strip() or normalized[:THUMBNAIL_TEXT_MAX_LENGTH]
 
         return normalized.upper()
+
+    def _normalize_cover_text_options(
+        self,
+        options: list[Any],
+        primary_text: Any,
+        visual_basis: str,
+    ) -> list[CoverTextCandidate]:
+        normalized: list[CoverTextCandidate] = []
+        seen: set[str] = set()
+
+        def add_candidate(text_value: Any, score_value: Any, fallback_score: float = 8.5) -> None:
+            cleaned = self._normalize_thumbnail_text(text_value, visual_basis)
+            if not cleaned or cleaned in seen:
+                return
+            seen.add(cleaned)
+            normalized.append(
+                CoverTextCandidate(
+                    text=cleaned,
+                    score=self._normalize_score(score_value if score_value is not None else fallback_score),
+                )
+            )
+
+        for item in options[:COVER_TEXT_OPTION_COUNT]:
+            add_candidate(getattr(item, "text", item), getattr(item, "score", None))
+
+        add_candidate(primary_text, 9.0)
+
+        for fallback_text in self._build_cover_text_fallbacks(
+            primary_text=self._normalize_thumbnail_text(primary_text, visual_basis),
+            visual_basis=visual_basis,
+        ):
+            add_candidate(fallback_text, 7.8)
+            if len(normalized) >= COVER_TEXT_OPTION_COUNT:
+                break
+
+        normalized.sort(key=lambda item: item.score, reverse=True)
+        return normalized[:COVER_TEXT_OPTION_COUNT]
+
+    def _build_cover_text_fallbacks(self, primary_text: str, visual_basis: str) -> list[str]:
+        seeds: list[str] = []
+        base = primary_text or self._normalize_thumbnail_text(visual_basis, visual_basis)
+        words = [word for word in base.split() if word]
+
+        if base:
+            seeds.append(base)
+
+        if words:
+            focus = " ".join(words[: min(3, len(words))]).strip()
+            if focus:
+                seeds.append(f"WATCH {focus}")
+                seeds.append(f"WAIT FOR {focus}")
+                seeds.append(f"{focus} REVEAL")
+
+        return seeds
 
     def _normalize_thumbnail_timestamp(
         self,
@@ -548,6 +647,32 @@ class GeminiVisionService:
             return 7.5
         return round(min(max(numeric, 1.0), 10.0), 1)
 
+    def _build_cover_image_prompt(
+        self,
+        cover_text: str,
+        visual_basis: str,
+        frame_summary: str,
+        width: Optional[int],
+        height: Optional[int],
+    ) -> str:
+        orientation = "portrait" if height and width and height > width else "landscape"
+        ratio = f"{width}:{height}" if width and height else ("9:16" if orientation == "portrait" else "16:9")
+        return f"""
+Use case: photorealistic-natural
+Asset type: YouTube Shorts cover background
+Primary request: Create a hyperrealistic, highly clickable YouTube Shorts cover image based on the provided reference frame.
+Input images: Image 1: reference frame from the uploaded video
+Scene/backdrop: {visual_basis}
+Subject: {frame_summary}
+Style/medium: cinematic photoreal image, premium thumbnail-quality realism
+Composition/framing: same aspect ratio as the source video, stronger focal point, cleaner composition, visually dramatic, mobile-first readability
+Lighting/mood: high contrast, polished, vivid, dramatic but believable
+Text (verbatim): "{cover_text}"
+Constraints: preserve the core subject and scene topic from the frame; generate a new thumbnail-style image that feels more intense and polished than the raw frame; keep it realistic; no collage; no split panels; no watermark; no logos; no UI chrome; no subtitles; do not render any text into the image
+Avoid: cartoon look, illustration look, blurry output, surreal distortions, extra hands, duplicate objects, unreadable clutter
+Additional instruction: treat the quoted text as hook intent only, not as text to draw. The final image should be in a {orientation} composition matching approximately {ratio}.
+""".strip()
+
     def _normalize_detected_objects(self, detected_objects: list[Any]) -> list[Any]:
         unique: dict[str, Any] = {}
         for item in detected_objects:
@@ -595,3 +720,36 @@ class GeminiVisionService:
             data=image_path.read_bytes(),
             mime_type=mime_type,
         )
+
+    @staticmethod
+    def _extract_generated_image_bytes(response: Any) -> Optional[bytes]:
+        candidates = []
+
+        direct_parts = getattr(response, "parts", None)
+        if direct_parts:
+            candidates.extend(direct_parts)
+
+        for candidate in getattr(response, "candidates", []) or []:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) if content is not None else None
+            if parts:
+                candidates.extend(parts)
+
+        for part in candidates:
+            inline_data = getattr(part, "inline_data", None)
+            data = getattr(inline_data, "data", None) if inline_data is not None else None
+            if data:
+                return data
+
+        return None
+
+    @staticmethod
+    def _import_pillow_image_module() -> Any:
+        try:
+            from PIL import Image  # type: ignore
+        except ImportError as error:
+            raise GeminiVisionServiceError(
+                "Pillow is required for AI-generated cover handling. Install it with `pip install -r requirements.txt`."
+            ) from error
+
+        return Image

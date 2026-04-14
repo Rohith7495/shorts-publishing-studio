@@ -1,11 +1,13 @@
 "use client";
 
-import { FormEvent, useDeferredValue, useEffect, useState, useTransition } from "react";
+import { FormEvent, useEffect, useState, useTransition } from "react";
 
 import { API_BASE_URL } from "@/lib/api";
 import type {
   GenerationResponse,
   YouTubeAuthStatus,
+  YouTubePublishJobStartResponse,
+  YouTubePublishJobStatusResponse,
   YouTubePublishResponse,
 } from "@/lib/types";
 
@@ -22,6 +24,21 @@ const DEFAULT_AUTH_STATUS: YouTubeAuthStatus = {
   channel_title: null,
   channel_id: null,
 };
+
+const GENERATION_STAGES = [
+  {
+    label: "Uploading video",
+    detail: "Sending the video from your browser to the live backend.",
+  },
+  {
+    label: "Extracting frames",
+    detail: "Sampling key frames and reading video metadata.",
+  },
+  {
+    label: "Asking Gemini",
+    detail: "Generating titles, descriptions, hashtags, and first comment ideas.",
+  },
+] as const;
 
 function formatDateTimeLocalInput(date: Date) {
   const year = date.getFullYear();
@@ -41,6 +58,9 @@ export function UploadStudio() {
   const [results, setResults] = useState<GenerationResponse | null>(null);
   const [authStatus, setAuthStatus] = useState<YouTubeAuthStatus>(DEFAULT_AUTH_STATUS);
   const [publishResult, setPublishResult] = useState<YouTubePublishResponse | null>(null);
+  const [publishJobId, setPublishJobId] = useState<string | null>(null);
+  const [publishJobStatus, setPublishJobStatus] = useState<YouTubePublishJobStatusResponse | null>(null);
+  const [publishElapsedMs, setPublishElapsedMs] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [copyState, setCopyState] = useState<CopyState | null>(null);
@@ -52,19 +72,137 @@ export function UploadStudio() {
   const [titleDraft, setTitleDraft] = useState("");
   const [descriptionDraft, setDescriptionDraft] = useState("");
   const [tagsDraft, setTagsDraft] = useState("");
-  const [thumbnailTextDraft, setThumbnailTextDraft] = useState("");
-  const [uploadThumbnail, setUploadThumbnail] = useState(true);
   const [firstCommentDraft, setFirstCommentDraft] = useState("");
   const [postFirstComment, setPostFirstComment] = useState(true);
   const [publishMode, setPublishMode] = useState<PublishMode>("private");
   const [scheduleAtDraft, setScheduleAtDraft] = useState("");
   const [isPending, startTransition] = useTransition();
-  const deferredThumbnailText = useDeferredValue(thumbnailTextDraft);
+  const [showGenerationProgress, setShowGenerationProgress] = useState(false);
+  const [generationStageIndex, setGenerationStageIndex] = useState(0);
+  const [generationStartedAt, setGenerationStartedAt] = useState<number | null>(null);
+  const [generationElapsedMs, setGenerationElapsedMs] = useState<number | null>(null);
+  const [generationDisplayElapsedMs, setGenerationDisplayElapsedMs] = useState<number | null>(null);
 
   useEffect(() => {
     void fetchAuthStatus();
     handleOAuthReturn();
   }, []);
+
+  useEffect(() => {
+    if (!isSubmitting) {
+      return;
+    }
+
+    setGenerationStageIndex(0);
+    const timers = [
+      window.setTimeout(() => setGenerationStageIndex((current) => Math.max(current, 1)), 900),
+      window.setTimeout(() => setGenerationStageIndex((current) => Math.max(current, 2)), 2200),
+    ];
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [isSubmitting]);
+
+  useEffect(() => {
+    if (generationStartedAt === null || !isSubmitting) {
+      return;
+    }
+
+    const updateElapsed = () => {
+      setGenerationDisplayElapsedMs(Date.now() - generationStartedAt);
+    };
+
+    updateElapsed();
+    const interval = window.setInterval(updateElapsed, 250);
+    return () => window.clearInterval(interval);
+  }, [generationStartedAt, isSubmitting]);
+
+  useEffect(() => {
+    if (!publishJobId || !isPublishing) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const pollPublishJob = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/youtube/publish/jobs/${publishJobId}`, {
+          credentials: "include",
+        });
+
+        if (!response.ok) {
+          let backendMessage = `Publish status failed with ${response.status}.`;
+          try {
+            const errorPayload = (await response.json()) as { detail?: string };
+            if (errorPayload.detail) {
+              backendMessage = errorPayload.detail;
+            }
+          } catch {
+            // Keep generic error if the backend did not return JSON.
+          }
+          throw new Error(backendMessage);
+        }
+
+        const payload = (await response.json()) as YouTubePublishJobStatusResponse;
+        if (cancelled) {
+          return;
+        }
+
+        setPublishJobStatus(payload);
+
+        if (payload.state === "succeeded" && payload.result) {
+          setPublishElapsedMs(payload.elapsed_ms);
+          setPublishResult(payload.result);
+          setNotice(
+            payload.result.publish_at
+              ? payload.result.deleted_local_upload
+                ? "Scheduled on YouTube. The temporary local upload was deleted from the server."
+                : "Scheduled on YouTube."
+              : payload.result.deleted_local_upload
+                ? "Published to YouTube. The temporary local upload was deleted from the server."
+                : "Published to YouTube.",
+          );
+          setIsPublishing(false);
+          setPublishJobId(null);
+          return;
+        }
+
+        if (payload.state === "failed") {
+          setPublishElapsedMs(payload.elapsed_ms);
+          setError(payload.error ?? "Something went wrong while publishing to YouTube.");
+          setIsPublishing(false);
+          setPublishJobId(null);
+          return;
+        }
+
+        timeoutId = window.setTimeout(() => {
+          void pollPublishJob();
+        }, 1000);
+      } catch (pollError) {
+        if (cancelled) {
+          return;
+        }
+        setIsPublishing(false);
+        setPublishJobId(null);
+        setError(
+          pollError instanceof Error
+            ? pollError.message
+            : "Something went wrong while checking YouTube publish status.",
+        );
+      }
+    };
+
+    void pollPublishJob();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [isPublishing, publishJobId]);
 
   async function fetchAuthStatus() {
     setIsCheckingAuth(true);
@@ -136,6 +274,12 @@ export function UploadStudio() {
     setError(null);
     setNotice(null);
     setPublishResult(null);
+    setShowGenerationProgress(true);
+    setGenerationStageIndex(0);
+    const startedAt = Date.now();
+    setGenerationStartedAt(startedAt);
+    setGenerationElapsedMs(null);
+    setGenerationDisplayElapsedMs(0);
 
     try {
       await discardUploadSession(results?.upload_session_id);
@@ -167,7 +311,18 @@ export function UploadStudio() {
         setResults(payload);
         applySuggestedMetadata(payload);
       });
+      const totalElapsed = Date.now() - startedAt;
+      setGenerationElapsedMs(totalElapsed);
+      setGenerationDisplayElapsedMs(totalElapsed);
+      window.setTimeout(() => setShowGenerationProgress(false), 350);
+      setPublishJobId(null);
+      setPublishJobStatus(null);
+      setPublishElapsedMs(null);
     } catch (submissionError) {
+      setShowGenerationProgress(false);
+      setGenerationStartedAt(null);
+      setGenerationElapsedMs(null);
+      setGenerationDisplayElapsedMs(null);
       setError(
         submissionError instanceof Error
           ? submissionError.message
@@ -184,8 +339,6 @@ export function UploadStudio() {
     setTitleDraft(payload.hook_titles[0]?.text ?? "");
     setDescriptionDraft(payload.descriptions[0]?.text ?? "");
     setTagsDraft(payload.hashtags.join(" "));
-    setThumbnailTextDraft(payload.thumbnail_text ?? "");
-    setUploadThumbnail(Boolean(payload.thumbnail_text));
     setFirstCommentDraft(payload.first_comment_text ?? "");
     setPostFirstComment(Boolean(payload.first_comment_text));
     setPublishMode("private");
@@ -205,13 +358,14 @@ export function UploadStudio() {
     setSelectedFile(file);
     setResults(null);
     setPublishResult(null);
+    setPublishJobId(null);
+    setPublishJobStatus(null);
+    setPublishElapsedMs(null);
     setError(null);
     setNotice(null);
     setTitleDraft("");
     setDescriptionDraft("");
     setTagsDraft("");
-    setThumbnailTextDraft("");
-    setUploadThumbnail(true);
     setFirstCommentDraft("");
     setPostFirstComment(true);
     setSelectedTitleIndex(0);
@@ -296,11 +450,6 @@ export function UploadStudio() {
       return;
     }
 
-    if (uploadThumbnail && !thumbnailTextDraft.trim()) {
-      setError("Enter thumbnail text or turn off the automatic thumbnail upload.");
-      return;
-    }
-
     if (postFirstComment && !firstCommentDraft.trim()) {
       setError("Enter the first comment text or turn off first-comment posting.");
       return;
@@ -330,11 +479,15 @@ export function UploadStudio() {
     }
 
     setIsPublishing(true);
+    setPublishJobId(null);
+    setPublishJobStatus(null);
+    setPublishElapsedMs(null);
     setError(null);
     setNotice(null);
+    setPublishResult(null);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/youtube/publish`, {
+      const response = await fetch(`${API_BASE_URL}/api/youtube/publish/start`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -347,8 +500,6 @@ export function UploadStudio() {
           tags: parseTags(tagsDraft),
           privacy_status: effectivePrivacyStatus,
           publish_at: publishAt,
-          thumbnail_text: uploadThumbnail ? thumbnailTextDraft.trim() : null,
-          thumbnail_timestamp_seconds: results.thumbnail_timestamp_seconds ?? null,
           post_first_comment: postFirstComment,
           first_comment_text: postFirstComment ? firstCommentDraft.trim() : null,
         }),
@@ -367,24 +518,27 @@ export function UploadStudio() {
         throw new Error(backendMessage);
       }
 
-      const payload = (await response.json()) as YouTubePublishResponse;
-      setPublishResult(payload);
-      setNotice(
-        payload.publish_at
-          ? payload.deleted_local_upload
-            ? "Scheduled on YouTube. The temporary local upload was deleted from the server."
-            : "Scheduled on YouTube."
-          : payload.deleted_local_upload
-            ? "Published to YouTube. The temporary local upload was deleted from the server."
-            : "Published to YouTube.",
-      );
+      const payload = (await response.json()) as YouTubePublishJobStartResponse;
+      setPublishJobId(payload.job_id);
+      setPublishJobStatus({
+        job_id: payload.job_id,
+        state: payload.state,
+        stage: "Queued",
+        detail: "The YouTube publish job is starting on the backend.",
+        progress_percent: null,
+        uploaded_bytes: null,
+        total_bytes: null,
+        remaining_seconds: null,
+        elapsed_ms: 0,
+        result: null,
+        error: null,
+      });
     } catch (publishError) {
       setError(
         publishError instanceof Error
           ? publishError.message
           : "Something went wrong while publishing to YouTube.",
       );
-    } finally {
       setIsPublishing(false);
     }
   }
@@ -422,7 +576,7 @@ export function UploadStudio() {
   }
 
   function formatBytes(value?: number | null) {
-    if (!value) {
+    if (value == null) {
       return "Unknown";
     }
     const units = ["B", "KB", "MB", "GB"];
@@ -433,6 +587,21 @@ export function UploadStudio() {
       unitIndex += 1;
     }
     return `${current.toFixed(1)} ${units[unitIndex]}`;
+  }
+
+  function formatRemainingTime(value?: number | null) {
+    if (value == null || !Number.isFinite(value)) {
+      return "Estimating...";
+    }
+
+    const totalSeconds = Math.max(0, value);
+    if (totalSeconds < 60) {
+      return `${Math.round(totalSeconds)}s`;
+    }
+
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = Math.round(totalSeconds % 60);
+    return `${minutes}m ${seconds}s`;
   }
 
   function formatLabel(value: string) {
@@ -463,11 +632,20 @@ export function UploadStudio() {
     return `YouTube will keep this upload private until ${date.toLocaleString()}.`;
   }
 
-  const thumbnailPreviewUrl = results
-    ? `${API_BASE_URL}${results.thumbnail_preview_path}?text=${encodeURIComponent(
-        deferredThumbnailText || results.thumbnail_text,
-      )}${results.thumbnail_timestamp_seconds != null ? `&source_timestamp_seconds=${results.thumbnail_timestamp_seconds}` : ""}`
-    : null;
+  function formatElapsedTime(value?: number | null) {
+    if (value == null) {
+      return "Unknown";
+    }
+
+    const totalSeconds = Math.max(0, value / 1000);
+    if (totalSeconds < 60) {
+      return `${totalSeconds.toFixed(1)}s`;
+    }
+
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}m ${seconds.toFixed(1)}s`;
+  }
 
   const canPublish =
     Boolean(results?.upload_session_id) &&
@@ -478,7 +656,6 @@ export function UploadStudio() {
     titleDraft.trim().length > 0 &&
     descriptionDraft.trim().length > 0 &&
     (publishMode !== "scheduled" || scheduleAtDraft.trim().length > 0) &&
-    (!uploadThumbnail || thumbnailTextDraft.trim().length > 0) &&
     (!postFirstComment || firstCommentDraft.trim().length > 0);
 
   return (
@@ -569,7 +746,7 @@ export function UploadStudio() {
           <div className="info-card">
             <h3>What happens</h3>
             <ul>
-              <li>The backend samples frames and generates titles, descriptions, and hashtags.</li>
+              <li>The backend samples frames and generates titles, descriptions, hashtags, and a first comment suggestion.</li>
               <li>You choose or edit the metadata before publish.</li>
               <li>The video uploads to YouTube through the official API.</li>
               <li>The temporary local upload is deleted after a successful YouTube upload.</li>
@@ -579,6 +756,40 @@ export function UploadStudio() {
           {notice ? <p className="success-banner">{notice}</p> : null}
           {error ? <p className="error-banner">{error}</p> : null}
 
+          {showGenerationProgress ? (
+            <div className="info-card progress-card">
+              <h3>Generation Progress</h3>
+              <div className="progress-list">
+                {GENERATION_STAGES.map((stage, index) => {
+                  const state =
+                    index < generationStageIndex
+                      ? "complete"
+                      : index === generationStageIndex
+                        ? "active"
+                        : "pending";
+
+                  return (
+                    <div key={stage.label} className={`progress-step progress-step-${state}`}>
+                      <div className="progress-dot" aria-hidden="true" />
+                      <div>
+                        <strong>{stage.label}</strong>
+                        <p>{stage.detail}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="section-caption">
+                {isSubmitting
+                  ? "The live backend is still working through the current stage."
+                  : "Finalizing the package response."}
+              </p>
+              <p className="section-caption">
+                Elapsed time: {formatElapsedTime(generationDisplayElapsedMs)}
+              </p>
+            </div>
+          ) : null}
+
           <button className="primary-button" type="submit" disabled={isSubmitting || isPending}>
             {isSubmitting || isPending ? "Generating package..." : "Generate YouTube Package"}
           </button>
@@ -587,7 +798,7 @@ export function UploadStudio() {
         <section className="studio-panel results-panel">
           <div className="panel-header">
             <h2>Review And Publish</h2>
-            <p>Review the AI-generated package, edit any field you want, and publish directly to YouTube.</p>
+            <p>Review the generated package, edit any field you want, and publish directly to YouTube.</p>
           </div>
 
           {!results ? (
@@ -604,6 +815,10 @@ export function UploadStudio() {
                 <div>
                   <span className="meta-label">Temp upload expires</span>
                   <strong>{formatExpiry(results.upload_expires_at)}</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Generation time</span>
+                  <strong>{formatElapsedTime(generationElapsedMs)}</strong>
                 </div>
                 <button
                   type="button"
@@ -689,60 +904,7 @@ export function UploadStudio() {
                 ))}
               </div>
 
-              <div className="results-section two-column">
-                <article className="info-card">
-                  <h3>Auto Thumbnail</h3>
-                  <p className="section-caption">
-                    Built from the best sampled frame and your editable thumbnail text.
-                  </p>
-                  {thumbnailPreviewUrl ? (
-                    <div className="thumbnail-preview-grid">
-                      <figure className="thumbnail-preview-card">
-                        <figcaption>Upload Preview 16:9</figcaption>
-                        <div className="thumbnail-preview-frame thumbnail-preview-frame-wide">
-                          <div className="thumbnail-safe-crop-guide" aria-hidden="true" />
-                          <img
-                            className="thumbnail-preview"
-                            src={thumbnailPreviewUrl}
-                            alt="Generated thumbnail upload preview"
-                          />
-                        </div>
-                      </figure>
-                      <figure className="thumbnail-preview-card">
-                        <figcaption>Shorts Mobile Crop 4:5</figcaption>
-                        <div className="thumbnail-preview-frame thumbnail-preview-frame-mobile">
-                          <img
-                            className="thumbnail-preview thumbnail-preview-mobile-image"
-                            src={thumbnailPreviewUrl}
-                            alt="Approximate mobile crop preview"
-                          />
-                        </div>
-                      </figure>
-                    </div>
-                  ) : null}
-                  <label className="checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={uploadThumbnail}
-                      onChange={(event) => setUploadThumbnail(event.target.checked)}
-                    />
-                    <span>Upload this custom thumbnail to YouTube after the video upload</span>
-                  </label>
-                  <label className="field-group">
-                    <span>Thumbnail Text</span>
-                    <input
-                      value={thumbnailTextDraft}
-                      maxLength={80}
-                      onChange={(event) => setThumbnailTextDraft(event.target.value)}
-                      placeholder="Short, bold thumbnail text"
-                    />
-                  </label>
-                  <p className="section-caption">
-                    Best frame: {results.thumbnail_timestamp_seconds ?? 0}s. The uploaded image stays 16:9 for YouTube,
-                    while the mobile card shows an approximate 4:5 crop so you can keep text in a safer center area.
-                  </p>
-                </article>
-
+              <div className="results-section">
                 <article className="info-card">
                   <h3>First Comment</h3>
                   <p className="section-caption">
@@ -845,14 +1007,48 @@ export function UploadStudio() {
                     onClick={() => void publishToYouTube()}
                   >
                     {isPublishing
-                      ? publishMode === "scheduled"
-                        ? "Scheduling On YouTube..."
-                        : "Uploading To YouTube..."
+                      ? publishJobStatus?.stage
+                        ? `${publishJobStatus.stage}...`
+                        : publishMode === "scheduled"
+                          ? "Scheduling On YouTube..."
+                          : "Uploading To YouTube..."
                       : publishMode === "scheduled"
                         ? "Schedule On YouTube"
                         : "Publish To YouTube"}
                   </button>
                 </div>
+
+                {isPublishing && publishJobStatus ? (
+                  <article className="info-card">
+                    <h3>Live Publish Status</h3>
+                    <p className="section-caption">
+                      {publishJobStatus.detail ?? "The backend is still working through the YouTube publish flow."}
+                    </p>
+                    <div className="publish-meta">
+                      <span className="meta-label">Stage: {publishJobStatus.stage}</span>
+                      <span className="meta-label">Elapsed: {formatElapsedTime(publishJobStatus.elapsed_ms)}</span>
+                    </div>
+                    {publishJobStatus.progress_percent != null ? (
+                      <div className="publish-meta">
+                        <span className="meta-label">
+                          Upload progress: {publishJobStatus.progress_percent.toFixed(1)}%
+                        </span>
+                        <span className="meta-label">
+                          ETA: {formatRemainingTime(publishJobStatus.remaining_seconds)}
+                        </span>
+                      </div>
+                    ) : null}
+                    {publishJobStatus.uploaded_bytes != null && publishJobStatus.total_bytes != null ? (
+                      <p className="section-caption">
+                        {formatBytes(publishJobStatus.uploaded_bytes)} / {formatBytes(publishJobStatus.total_bytes)}
+                      </p>
+                    ) : (
+                      <p className="section-caption">
+                        YouTube upload progress becomes more accurate once the backend starts sending the video file.
+                      </p>
+                    )}
+                  </article>
+                ) : null}
 
                 {publishResult ? (
                   <article className="info-card success-card">
@@ -865,10 +1061,10 @@ export function UploadStudio() {
                     {publishResult.publish_at ? (
                       <p>The video stays private on YouTube until the scheduled publish time arrives.</p>
                     ) : null}
-                    <p>
-                      Thumbnail upload: {publishResult.thumbnail_uploaded ? "completed" : "not applied"}.
-                      First comment: {publishResult.first_comment_posted ? "posted" : "not posted"}.
-                    </p>
+                    {publishElapsedMs != null ? (
+                      <p>Total publish time: {formatElapsedTime(publishElapsedMs)}</p>
+                    ) : null}
+                    <p>First comment: {publishResult.first_comment_posted ? "posted" : "not posted"}.</p>
                     {publishResult.publish_notes.length > 0 ? (
                       <ul className="notes-list">
                         {publishResult.publish_notes.map((note) => (
