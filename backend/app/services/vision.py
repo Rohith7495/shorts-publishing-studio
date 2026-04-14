@@ -16,10 +16,12 @@ TITLE_TARGET_IDEAL_LENGTH = 99
 MAX_TITLE_TAGS = 3
 MAX_SUFFIX_CANDIDATE_TAGS = 6
 DESCRIPTION_MAX_HASHTAGS = 5
+THUMBNAIL_TEXT_MAX_LENGTH = 42
 HASHTAG_PATTERN = re.compile(r"#[A-Za-z0-9_]+")
 WHITESPACE_PATTERN = re.compile(r"\s+")
 SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+")
 CTA_SIGNAL_PATTERN = re.compile(r"\b(watch|stay|wait|see|catch)\b")
+NON_WORD_THUMBNAIL_PATTERN = re.compile(r"[^A-Za-z0-9' ]+")
 TITLE_TRAILING_STOPWORDS = {
     "a",
     "an",
@@ -156,6 +158,12 @@ class GeminiVisionService:
             output.visual_basis,
             output.hashtags,
         )
+        output.thumbnail_text = self._normalize_thumbnail_text(output.thumbnail_text, output.visual_basis)
+        output.thumbnail_timestamp_seconds = self._normalize_thumbnail_timestamp(
+            output.thumbnail_timestamp_seconds,
+            frame_samples,
+        )
+        output.first_comment_text = self._normalize_first_comment(output.first_comment_text, output.visual_basis)
         output.detected_objects = self._normalize_detected_objects(output.detected_objects)
         output.frame_insights = self._normalize_frame_insights(output.frame_insights, frame_samples)
         return output
@@ -243,6 +251,52 @@ class GeminiVisionService:
             extracted.append(cleaned)
 
         return extracted
+
+    def _normalize_thumbnail_text(self, value: Any, visual_basis: str) -> str:
+        raw_text = WHITESPACE_PATTERN.sub(" ", str(value or "")).strip()
+        raw_text = raw_text.replace("#", "")
+        raw_text = NON_WORD_THUMBNAIL_PATTERN.sub("", raw_text)
+        raw_text = WHITESPACE_PATTERN.sub(" ", raw_text).strip()
+
+        if not raw_text:
+            raw_text = visual_basis
+
+        words = raw_text.split()
+        if len(words) > 7:
+            words = words[:7]
+        normalized = " ".join(words).strip()
+
+        if len(normalized) > THUMBNAIL_TEXT_MAX_LENGTH:
+            normalized = normalized[:THUMBNAIL_TEXT_MAX_LENGTH].rsplit(" ", 1)[0].strip() or normalized[:THUMBNAIL_TEXT_MAX_LENGTH]
+
+        return normalized.upper()
+
+    def _normalize_thumbnail_timestamp(
+        self,
+        value: Optional[float],
+        frame_samples: list[FrameSample],
+    ) -> Optional[float]:
+        if not frame_samples:
+            return None
+
+        try:
+            target = float(value) if value is not None else frame_samples[len(frame_samples) // 2].timestamp_seconds
+        except (TypeError, ValueError):
+            target = frame_samples[len(frame_samples) // 2].timestamp_seconds
+
+        best_sample = min(
+            frame_samples,
+            key=lambda sample: abs(sample.timestamp_seconds - target),
+        )
+        return best_sample.timestamp_seconds
+
+    def _normalize_first_comment(self, value: Any, visual_basis: str) -> str:
+        cleaned = WHITESPACE_PATTERN.sub(" ", str(value or "")).strip()
+        if not cleaned:
+            cleaned = f"What would you do in this moment? {visual_basis}"
+        if len(cleaned) > 220:
+            cleaned = cleaned[:220].rsplit(" ", 1)[0].strip() or cleaned[:220]
+        return cleaned
 
     def _collect_title_tag_candidates(
         self,

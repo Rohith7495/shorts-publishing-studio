@@ -48,6 +48,9 @@ class VisionModelOutput(BaseModel):
     hook_titles: list[HookTitleCandidate]
     descriptions: list[DescriptionCandidate]
     hashtags: list[str]
+    thumbnail_text: str
+    thumbnail_timestamp_seconds: Optional[float] = None
+    first_comment_text: str
     detected_objects: list[DetectedObject]
     frame_insights: list[FrameInsight]
 
@@ -55,6 +58,7 @@ class VisionModelOutput(BaseModel):
 class GenerationResponse(VisionModelOutput):
     upload_session_id: str
     upload_expires_at: str
+    thumbnail_preview_path: str
     metadata: VideoMetadata
     processing_notes: list[str]
 
@@ -77,6 +81,10 @@ class YouTubePublishRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
     privacy_status: Literal["private", "unlisted", "public"] = "private"
     publish_at: Optional[datetime] = None
+    thumbnail_text: Optional[str] = Field(default=None, max_length=80)
+    thumbnail_timestamp_seconds: Optional[float] = None
+    post_first_comment: bool = False
+    first_comment_text: Optional[str] = Field(default=None, max_length=1000)
     enhancements: VideoEnhancementOptions = Field(default_factory=VideoEnhancementOptions)
 
     @field_validator("publish_at")
@@ -98,6 +106,21 @@ class YouTubePublishRequest(BaseModel):
             raise ValueError("publish_at must be in the future.")
         return self
 
+    @model_validator(mode="after")
+    def validate_optional_publish_features(self) -> "YouTubePublishRequest":
+        if self.thumbnail_text is not None:
+            cleaned_thumbnail = self.thumbnail_text.strip()
+            self.thumbnail_text = cleaned_thumbnail or None
+
+        if self.first_comment_text is not None:
+            cleaned_comment = self.first_comment_text.strip()
+            self.first_comment_text = cleaned_comment or None
+
+        if self.post_first_comment and not self.first_comment_text:
+            raise ValueError("Enter a first comment before enabling automatic first-comment posting.")
+
+        return self
+
 
 class YouTubePublishResponse(BaseModel):
     video_id: str
@@ -105,5 +128,9 @@ class YouTubePublishResponse(BaseModel):
     studio_url: str
     privacy_status: Literal["private", "unlisted", "public"]
     publish_at: Optional[datetime] = None
+    thumbnail_uploaded: bool = False
+    first_comment_posted: bool = False
+    first_comment_id: Optional[str] = None
     deleted_local_upload: bool
     applied_enhancements: list[str] = Field(default_factory=list)
+    publish_notes: list[str] = Field(default_factory=list)

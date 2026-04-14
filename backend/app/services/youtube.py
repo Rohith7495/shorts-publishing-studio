@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 YOUTUBE_READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
 
 
 class YouTubeServiceError(RuntimeError):
@@ -109,7 +110,7 @@ class YouTubeOAuthService:
         try:
             credentials = credentials_module.from_authorized_user_info(
                 credentials_payload,
-                scopes=[YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE],
+                scopes=[YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE, YOUTUBE_FORCE_SSL_SCOPE],
             )
         except Exception as error:
             raise YouTubeServiceError(f"Stored Google credentials could not be restored: {error}") from error
@@ -170,7 +171,7 @@ class YouTubeOAuthService:
                     "token_uri": "https://oauth2.googleapis.com/token",
                 }
             },
-            scopes=[YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE],
+            scopes=[YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE, YOUTUBE_FORCE_SSL_SCOPE],
             state=state,
             code_verifier=code_verifier,
         )
@@ -307,6 +308,55 @@ class YouTubeUploadService:
             "studio_url": f"https://studio.youtube.com/video/{video_id}/edit",
         }
 
+    def upload_thumbnail(
+        self,
+        credentials: Any,
+        video_id: str,
+        thumbnail_path: Path,
+    ) -> None:
+        build, media_file_upload = self._import_youtube_client_modules()
+        youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
+
+        try:
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=media_file_upload(str(thumbnail_path), mimetype="image/jpeg"),
+            ).execute()
+        except Exception as error:
+            raise YouTubeServiceError(f"YouTube thumbnail upload failed: {error}") from error
+
+    def post_first_comment(
+        self,
+        credentials: Any,
+        video_id: str,
+        text: str,
+    ) -> str:
+        build, _ = self._import_youtube_client_modules()
+        youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
+        channel_id = self._get_authenticated_channel_id(youtube)
+
+        body = {
+            "snippet": {
+                "channelId": channel_id,
+                "videoId": video_id,
+                "topLevelComment": {
+                    "snippet": {
+                        "textOriginal": text.strip(),
+                    }
+                },
+            }
+        }
+
+        try:
+            response = youtube.commentThreads().insert(part="snippet", body=body).execute()
+        except Exception as error:
+            raise YouTubeServiceError(f"YouTube first-comment post failed: {error}") from error
+
+        comment_id = (((response.get("snippet") or {}).get("topLevelComment") or {}).get("id"))
+        if not comment_id:
+            raise YouTubeServiceError("YouTube did not return a comment ID after posting the first comment.")
+        return str(comment_id)
+
     @staticmethod
     def _normalize_tags(tags: list[str]) -> list[str]:
         normalized: list[str] = []
@@ -326,6 +376,17 @@ class YouTubeUploadService:
             normalized.append(cleaned)
 
         return normalized[:15]
+
+    @staticmethod
+    def _get_authenticated_channel_id(youtube: Any) -> str:
+        try:
+            payload = youtube.channels().list(part="id", mine=True).execute()
+            items = payload.get("items") or []
+            if not items or not items[0].get("id"):
+                raise ValueError("No authenticated YouTube channel was returned.")
+            return str(items[0]["id"])
+        except Exception as error:
+            raise YouTubeServiceError(f"Unable to determine the authenticated YouTube channel ID: {error}") from error
 
     @staticmethod
     def _import_youtube_client_modules() -> tuple[Any, Any]:

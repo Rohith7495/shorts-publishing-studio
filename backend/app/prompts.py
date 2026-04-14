@@ -38,6 +38,9 @@ What to produce:
 - `hook_titles`: exactly {max_titles} best curiosity-led YouTube Shorts titles, each with a clickability `score` from 1.0 to 10.0.
 - `descriptions`: exactly 2 YouTube Shorts descriptions with angles such as Hook, Reveal, Curiosity, Context, or Replay.
 - `hashtags`: 8 to {max_hashtags} relevant hashtags with leading # and no duplicates.
+- `thumbnail_text`: one short custom-thumbnail phrase based only on the visuals.
+- `thumbnail_timestamp_seconds`: the best matching frame timestamp for the thumbnail chosen from this set: {timestamp_list}.
+- `first_comment_text`: one creator-ready first comment that can be auto-posted after upload.
 - `frame_insights`: exactly {len(frame_samples)} items, one for each frame timestamp in this set: {timestamp_list}.
 
 Hook title guidelines:
@@ -73,6 +76,19 @@ Hashtag guidelines:
 - Prefer hashtags that help discoverability without looking random or stuffed.
 - Prefer compact hashtags because they may also appear at the end of titles.
 - Include #shorts unless it would create duplication.
+
+Thumbnail text guidelines:
+- Keep it 2 to 6 words when possible.
+- Make it bold, readable, emotionally strong, and easy to place on a thumbnail.
+- Do not add hashtags, emojis, quotes, or punctuation clutter.
+- Use the most visually surprising object, reveal, or tension point.
+
+First comment guidelines:
+- Make it feel like a natural creator comment posted right after upload.
+- Keep it engagement-friendly and short enough to read quickly.
+- It can ask a question, tease a follow-up, invite a reaction, or nudge viewers to subscribe.
+- Do not include links unless they are directly supported by the visible content.
+- Do not mention audio or off-screen context.
 
 Frame insight guidelines:
 - Match the provided timestamps exactly.

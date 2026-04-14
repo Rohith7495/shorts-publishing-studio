@@ -33,6 +33,8 @@ class VideoProcessingServiceError(RuntimeError):
 class VideoProcessingService:
     MAX_FRAME_WIDTH = 1024
     JPEG_QUALITY = 82
+    THUMBNAIL_SIZE = (1280, 720)
+    THUMBNAIL_MAX_TEXT_WIDTH_RATIO = 0.72
 
     def __init__(
         self,
@@ -217,6 +219,24 @@ class VideoProcessingService:
 
     def build_upload_expiry(self, record: StoredUploadSession) -> str:
         return record.expires_at.isoformat()
+
+    def render_thumbnail_preview(
+        self,
+        upload_session: StoredUploadSession,
+        text: str,
+        preferred_timestamp_seconds: Optional[float] = None,
+    ) -> Path:
+        frame_sample = self._select_thumbnail_frame(upload_session, preferred_timestamp_seconds)
+        if frame_sample is None:
+            raise VideoProcessingServiceError("No sampled frames are available to build a thumbnail preview.")
+
+        destination = upload_session.workspace_dir / "thumbnail-preview.jpg"
+        self._compose_thumbnail_image(
+            source_image=Path(frame_sample.image_path),
+            text=text,
+            destination=destination,
+        )
+        return destination
 
     def prepare_publish_video(
         self,
@@ -403,6 +423,193 @@ class VideoProcessingService:
 
         return timestamps[:6]
 
+    def _select_thumbnail_frame(
+        self,
+        upload_session: StoredUploadSession,
+        preferred_timestamp_seconds: Optional[float],
+    ) -> Optional[FrameSample]:
+        frame_samples = self._load_saved_frame_samples(upload_session)
+        if not frame_samples:
+            return None
+
+        if preferred_timestamp_seconds is None:
+            return frame_samples[len(frame_samples) // 2]
+
+        return min(
+            frame_samples,
+            key=lambda sample: abs(sample.timestamp_seconds - preferred_timestamp_seconds),
+        )
+
+    def _load_saved_frame_samples(self, upload_session: StoredUploadSession) -> list[FrameSample]:
+        frame_dir = upload_session.workspace_dir / "frames"
+        if not frame_dir.exists():
+            return []
+
+        frame_samples: list[FrameSample] = []
+        for frame_path in sorted(frame_dir.glob("*.jpg")):
+            stem_parts = frame_path.stem.split("-")
+            timestamp_ms = stem_parts[-1].removesuffix("ms") if stem_parts else ""
+            try:
+                timestamp_seconds = round(int(timestamp_ms) / 1000, 2)
+            except ValueError:
+                continue
+
+            frame_samples.append(
+                FrameSample(
+                    timestamp_seconds=timestamp_seconds,
+                    image_path=str(frame_path),
+                )
+            )
+
+        return frame_samples
+
+    def _compose_thumbnail_image(self, source_image: Path, text: str, destination: Path) -> None:
+        image_module, image_color_module, image_draw_module, image_font_module = self._import_pillow_modules()
+
+        with image_module.open(source_image) as raw_image:
+            base_image = raw_image.convert("RGB")
+
+        thumbnail = self._crop_to_thumbnail_canvas(image_module, base_image)
+        canvas = thumbnail.convert("RGBA")
+        overlay = image_module.new("RGBA", canvas.size, (0, 0, 0, 0))
+        overlay_draw = image_draw_module.Draw(overlay)
+        width, height = canvas.size
+
+        overlay_draw.rounded_rectangle(
+            (
+                int(width * 0.28),
+                int(height * 0.58),
+                int(width * 0.72),
+                int(height * 0.93),
+            ),
+            radius=36,
+            fill=(13, 13, 13, 150),
+        )
+        overlay_draw.rounded_rectangle(
+            (
+                int(width * 0.31),
+                int(height * 0.61),
+                int(width * 0.69),
+                int(height * 0.635),
+            ),
+            radius=12,
+            fill=(255, 107, 53, 230),
+        )
+
+        composed = image_module.alpha_composite(canvas, overlay)
+        draw = image_draw_module.Draw(composed)
+        accent_color = image_color_module.getrgb("#fff8ef")
+        font = self._load_thumbnail_font(image_font_module, size=88)
+        wrapped_lines = self._wrap_thumbnail_text(
+            draw=draw,
+            text=text,
+            font=font,
+            max_width=int(width * 0.38),
+        )
+
+        current_font_size = getattr(font, "size", 88)
+        while len(wrapped_lines) > 3 and current_font_size > 56:
+            current_font_size -= 6
+            font = self._load_thumbnail_font(image_font_module, size=current_font_size)
+            wrapped_lines = self._wrap_thumbnail_text(
+                draw=draw,
+                text=text,
+                font=font,
+                max_width=int(width * 0.38),
+            )
+
+        line_gap = 12
+        line_heights = []
+        for line in wrapped_lines:
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=5)
+            line_heights.append(max(1, bbox[3] - bbox[1]))
+        total_height = sum(line_heights) + line_gap * max(0, len(wrapped_lines) - 1)
+        current_y = int(height * 0.76 - total_height / 2)
+        center_x = int(width * 0.5)
+
+        for index, line in enumerate(wrapped_lines):
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=5)
+            line_width = max(1, bbox[2] - bbox[0])
+            x_position = center_x - int(line_width / 2)
+            draw.text(
+                (x_position, current_y),
+                line,
+                font=font,
+                fill=accent_color,
+                stroke_width=5,
+                stroke_fill=(19, 17, 33),
+            )
+            current_y += line_heights[index] + line_gap
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        composed.convert("RGB").save(destination, format="JPEG", quality=92, optimize=True)
+
+    def _crop_to_thumbnail_canvas(self, image_module: Any, source_image: Any) -> Any:
+        target_width, target_height = self.THUMBNAIL_SIZE
+        target_ratio = target_width / target_height
+        source_width, source_height = source_image.size
+        source_ratio = source_width / source_height if source_height else target_ratio
+
+        if source_ratio > target_ratio:
+            crop_width = int(source_height * target_ratio)
+            left = max(0, int((source_width - crop_width) / 2))
+            top = 0
+            right = left + crop_width
+            bottom = source_height
+        else:
+            crop_height = int(source_width / target_ratio)
+            top_bias = 0.38 if source_height > source_width else 0.5
+            top = max(0, min(source_height - crop_height, int((source_height - crop_height) * top_bias)))
+            left = 0
+            right = source_width
+            bottom = top + crop_height
+
+        cropped = source_image.crop((left, top, right, bottom))
+        return cropped.resize((target_width, target_height), image_module.Resampling.LANCZOS)
+
+    def _wrap_thumbnail_text(
+        self,
+        draw: Any,
+        text: str,
+        font: Any,
+        max_width: int,
+    ) -> list[str]:
+        words = text.strip().split()
+        if not words:
+            return ["WATCH THIS"]
+
+        lines: list[str] = []
+        current = words[0]
+
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            bbox = draw.textbbox((0, 0), candidate, font=font, stroke_width=5)
+            if bbox[2] <= max_width:
+                current = candidate
+                continue
+            lines.append(current)
+            current = word
+
+        lines.append(current)
+        return lines[:3]
+
+    @staticmethod
+    def _load_thumbnail_font(image_font_module: Any, size: int) -> Any:
+        candidate_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+        ]
+
+        for candidate in candidate_paths:
+            if Path(candidate).exists():
+                try:
+                    return image_font_module.truetype(candidate, size=size)
+                except OSError:
+                    continue
+
+        return image_font_module.load_default()
+
     @staticmethod
     def _parse_fps(raw_fps: Optional[str]) -> Optional[float]:
         if not raw_fps:
@@ -458,6 +665,16 @@ class VideoProcessingService:
         except ImportError:
             return None
         return cv2
+
+    @staticmethod
+    def _import_pillow_modules() -> tuple[Any, Any, Any, Any]:
+        try:
+            from PIL import Image, ImageColor, ImageDraw, ImageFont  # type: ignore
+        except ImportError as error:
+            raise VideoProcessingServiceError(
+                "Pillow is required for custom thumbnail generation. Install it with `pip install -r requirements.txt`."
+            ) from error
+        return Image, ImageColor, ImageDraw, ImageFont
 
     def _resize_frame_if_needed(self, cv2: Any, frame: Any) -> Any:
         height, width = frame.shape[:2]

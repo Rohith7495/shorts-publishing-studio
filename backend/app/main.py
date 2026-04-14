@@ -5,7 +5,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 from app.config import get_settings
 from app.schemas import (
@@ -100,6 +100,24 @@ def discard_upload(upload_session_id: str, request: Request) -> dict[str, object
 
     deleted = video_service.delete_upload_session(upload_session_id)
     return {"deleted": deleted}
+
+
+@app.get("/api/uploads/{upload_session_id}/thumbnail-preview")
+def thumbnail_preview(
+    upload_session_id: str,
+    text: Optional[str] = None,
+    source_timestamp_seconds: Optional[float] = None,
+) -> FileResponse:
+    upload_session = video_service.load_upload_session(upload_session_id)
+    if upload_session is None:
+        raise HTTPException(status_code=404, detail="The temporary upload session was not found or has expired.")
+
+    preview_path = video_service.render_thumbnail_preview(
+        upload_session=upload_session,
+        text=text or "WATCH THIS",
+        preferred_timestamp_seconds=source_timestamp_seconds,
+    )
+    return FileResponse(preview_path, media_type="image/jpeg")
 
 
 @app.get("/api/auth/youtube/start")
@@ -215,6 +233,40 @@ def publish_to_youtube(
     except VideoProcessingServiceError as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
 
+    publish_notes: list[str] = []
+    thumbnail_uploaded = False
+    first_comment_posted = False
+    first_comment_id: Optional[str] = None
+
+    if payload.thumbnail_text:
+        try:
+            thumbnail_path = video_service.render_thumbnail_preview(
+                upload_session=upload_session,
+                text=payload.thumbnail_text,
+                preferred_timestamp_seconds=payload.thumbnail_timestamp_seconds,
+            )
+            youtube_upload_service.upload_thumbnail(
+                credentials=credentials,
+                video_id=publish_result["video_id"],
+                thumbnail_path=thumbnail_path,
+            )
+            thumbnail_uploaded = True
+            publish_notes.append("Uploaded the generated custom thumbnail to YouTube.")
+        except (YouTubeServiceError, VideoProcessingServiceError) as error:
+            publish_notes.append(str(error))
+
+    if payload.post_first_comment and payload.first_comment_text:
+        try:
+            first_comment_id = youtube_upload_service.post_first_comment(
+                credentials=credentials,
+                video_id=publish_result["video_id"],
+                text=payload.first_comment_text,
+            )
+            first_comment_posted = True
+            publish_notes.append("Posted the first comment automatically after upload.")
+        except YouTubeServiceError as error:
+            publish_notes.append(str(error))
+
     deleted_local_upload = video_service.delete_upload_session(payload.upload_session_id)
     return YouTubePublishResponse(
         video_id=publish_result["video_id"],
@@ -222,8 +274,12 @@ def publish_to_youtube(
         studio_url=publish_result["studio_url"],
         privacy_status=payload.privacy_status,
         publish_at=payload.publish_at,
+        thumbnail_uploaded=thumbnail_uploaded,
+        first_comment_posted=first_comment_posted,
+        first_comment_id=first_comment_id,
         deleted_local_upload=deleted_local_upload,
         applied_enhancements=applied_enhancements,
+        publish_notes=publish_notes,
     )
 
 

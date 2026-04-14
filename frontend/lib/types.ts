@@ -35,10 +35,14 @@ export type GenerationResponse = {
   hook_titles: HookTitleCandidate[];
   descriptions: DescriptionCandidate[];
   hashtags: string[];
+  thumbnail_text: string;
+  thumbnail_timestamp_seconds?: number | null;
+  first_comment_text: string;
   detected_objects: DetectedObject[];
   frame_insights: FrameInsight[];
   upload_session_id: string;
   upload_expires_at: string;
+  thumbnail_preview_path: string;
   metadata: VideoMetadata;
   processing_notes: string[];
 };
@@ -55,5 +59,9 @@ export type YouTubePublishResponse = {
   studio_url: string;
   privacy_status: "private" | "unlisted" | "public";
   publish_at?: string | null;
+  thumbnail_uploaded: boolean;
+  first_comment_posted: boolean;
+  first_comment_id?: string | null;
   deleted_local_upload: boolean;
+  publish_notes: string[];
 };

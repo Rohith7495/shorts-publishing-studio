@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState, useTransition } from "react";
+import { FormEvent, useDeferredValue, useEffect, useState, useTransition } from "react";
 
 import { API_BASE_URL } from "@/lib/api";
 import type {
@@ -52,9 +52,14 @@ export function UploadStudio() {
   const [titleDraft, setTitleDraft] = useState("");
   const [descriptionDraft, setDescriptionDraft] = useState("");
   const [tagsDraft, setTagsDraft] = useState("");
+  const [thumbnailTextDraft, setThumbnailTextDraft] = useState("");
+  const [uploadThumbnail, setUploadThumbnail] = useState(true);
+  const [firstCommentDraft, setFirstCommentDraft] = useState("");
+  const [postFirstComment, setPostFirstComment] = useState(true);
   const [publishMode, setPublishMode] = useState<PublishMode>("private");
   const [scheduleAtDraft, setScheduleAtDraft] = useState("");
   const [isPending, startTransition] = useTransition();
+  const deferredThumbnailText = useDeferredValue(thumbnailTextDraft);
 
   useEffect(() => {
     void fetchAuthStatus();
@@ -179,6 +184,10 @@ export function UploadStudio() {
     setTitleDraft(payload.hook_titles[0]?.text ?? "");
     setDescriptionDraft(payload.descriptions[0]?.text ?? "");
     setTagsDraft(payload.hashtags.join(" "));
+    setThumbnailTextDraft(payload.thumbnail_text ?? "");
+    setUploadThumbnail(Boolean(payload.thumbnail_text));
+    setFirstCommentDraft(payload.first_comment_text ?? "");
+    setPostFirstComment(Boolean(payload.first_comment_text));
     setPublishMode("private");
     setScheduleAtDraft("");
   }
@@ -201,6 +210,10 @@ export function UploadStudio() {
     setTitleDraft("");
     setDescriptionDraft("");
     setTagsDraft("");
+    setThumbnailTextDraft("");
+    setUploadThumbnail(true);
+    setFirstCommentDraft("");
+    setPostFirstComment(true);
     setSelectedTitleIndex(0);
     setSelectedDescriptionIndex(0);
     setPublishMode("private");
@@ -283,6 +296,16 @@ export function UploadStudio() {
       return;
     }
 
+    if (uploadThumbnail && !thumbnailTextDraft.trim()) {
+      setError("Enter thumbnail text or turn off the automatic thumbnail upload.");
+      return;
+    }
+
+    if (postFirstComment && !firstCommentDraft.trim()) {
+      setError("Enter the first comment text or turn off first-comment posting.");
+      return;
+    }
+
     let publishAt: string | null = null;
     let effectivePrivacyStatus: PublishPrivacyStatus = publishMode === "scheduled" ? "private" : publishMode;
 
@@ -324,6 +347,10 @@ export function UploadStudio() {
           tags: parseTags(tagsDraft),
           privacy_status: effectivePrivacyStatus,
           publish_at: publishAt,
+          thumbnail_text: uploadThumbnail ? thumbnailTextDraft.trim() : null,
+          thumbnail_timestamp_seconds: results.thumbnail_timestamp_seconds ?? null,
+          post_first_comment: postFirstComment,
+          first_comment_text: postFirstComment ? firstCommentDraft.trim() : null,
         }),
       });
 
@@ -436,6 +463,12 @@ export function UploadStudio() {
     return `YouTube will keep this upload private until ${date.toLocaleString()}.`;
   }
 
+  const thumbnailPreviewUrl = results
+    ? `${API_BASE_URL}${results.thumbnail_preview_path}?text=${encodeURIComponent(
+        deferredThumbnailText || results.thumbnail_text,
+      )}${results.thumbnail_timestamp_seconds != null ? `&source_timestamp_seconds=${results.thumbnail_timestamp_seconds}` : ""}`
+    : null;
+
   const canPublish =
     Boolean(results?.upload_session_id) &&
     authStatus.connected &&
@@ -444,7 +477,9 @@ export function UploadStudio() {
     !isSubmitting &&
     titleDraft.trim().length > 0 &&
     descriptionDraft.trim().length > 0 &&
-    (publishMode !== "scheduled" || scheduleAtDraft.trim().length > 0);
+    (publishMode !== "scheduled" || scheduleAtDraft.trim().length > 0) &&
+    (!uploadThumbnail || thumbnailTextDraft.trim().length > 0) &&
+    (!postFirstComment || firstCommentDraft.trim().length > 0);
 
   return (
     <main className="page-shell">
@@ -654,6 +689,85 @@ export function UploadStudio() {
                 ))}
               </div>
 
+              <div className="results-section two-column">
+                <article className="info-card">
+                  <h3>Auto Thumbnail</h3>
+                  <p className="section-caption">
+                    Built from the best sampled frame and your editable thumbnail text.
+                  </p>
+                  {thumbnailPreviewUrl ? (
+                    <div className="thumbnail-preview-grid">
+                      <figure className="thumbnail-preview-card">
+                        <figcaption>Upload Preview 16:9</figcaption>
+                        <div className="thumbnail-preview-frame thumbnail-preview-frame-wide">
+                          <div className="thumbnail-safe-crop-guide" aria-hidden="true" />
+                          <img
+                            className="thumbnail-preview"
+                            src={thumbnailPreviewUrl}
+                            alt="Generated thumbnail upload preview"
+                          />
+                        </div>
+                      </figure>
+                      <figure className="thumbnail-preview-card">
+                        <figcaption>Shorts Mobile Crop 4:5</figcaption>
+                        <div className="thumbnail-preview-frame thumbnail-preview-frame-mobile">
+                          <img
+                            className="thumbnail-preview thumbnail-preview-mobile-image"
+                            src={thumbnailPreviewUrl}
+                            alt="Approximate mobile crop preview"
+                          />
+                        </div>
+                      </figure>
+                    </div>
+                  ) : null}
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={uploadThumbnail}
+                      onChange={(event) => setUploadThumbnail(event.target.checked)}
+                    />
+                    <span>Upload this custom thumbnail to YouTube after the video upload</span>
+                  </label>
+                  <label className="field-group">
+                    <span>Thumbnail Text</span>
+                    <input
+                      value={thumbnailTextDraft}
+                      maxLength={80}
+                      onChange={(event) => setThumbnailTextDraft(event.target.value)}
+                      placeholder="Short, bold thumbnail text"
+                    />
+                  </label>
+                  <p className="section-caption">
+                    Best frame: {results.thumbnail_timestamp_seconds ?? 0}s. The uploaded image stays 16:9 for YouTube,
+                    while the mobile card shows an approximate 4:5 crop so you can keep text in a safer center area.
+                  </p>
+                </article>
+
+                <article className="info-card">
+                  <h3>First Comment</h3>
+                  <p className="section-caption">
+                    Auto-post the first comment right after upload. You can pin it manually later in YouTube Studio.
+                  </p>
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={postFirstComment}
+                      onChange={(event) => setPostFirstComment(event.target.checked)}
+                    />
+                    <span>Post the first comment automatically after upload</span>
+                  </label>
+                  <label className="field-group">
+                    <span>First Comment Text</span>
+                    <textarea
+                      rows={5}
+                      value={firstCommentDraft}
+                      onChange={(event) => setFirstCommentDraft(event.target.value)}
+                      placeholder="Ask a question, tease the next short, or add your CTA here"
+                    />
+                  </label>
+                </article>
+              </div>
+
               <div className="results-section">
                 <h3>Publish To YouTube</h3>
                 <div className="info-card publish-panel">
@@ -750,6 +864,17 @@ export function UploadStudio() {
                     </p>
                     {publishResult.publish_at ? (
                       <p>The video stays private on YouTube until the scheduled publish time arrives.</p>
+                    ) : null}
+                    <p>
+                      Thumbnail upload: {publishResult.thumbnail_uploaded ? "completed" : "not applied"}.
+                      First comment: {publishResult.first_comment_posted ? "posted" : "not posted"}.
+                    </p>
+                    {publishResult.publish_notes.length > 0 ? (
+                      <ul className="notes-list">
+                        {publishResult.publish_notes.map((note) => (
+                          <li key={note}>{note}</li>
+                        ))}
+                      </ul>
                     ) : null}
                     <div className="link-row">
                       <a href={publishResult.video_url} target="_blank" rel="noreferrer">
