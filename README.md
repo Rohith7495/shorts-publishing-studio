@@ -68,6 +68,7 @@ Create `backend/.env` or export variables in your shell:
 ```bash
 export GEMINI_API_KEY=your_gemini_api_key_here
 export GEMINI_VISION_MODEL=gemini-2.5-flash-lite
+export GEMINI_FALLBACK_MODELS=
 export VIDEO_UPLOAD_DIR=storage/uploads
 export OAUTH_SESSION_DIR=storage/oauth_sessions
 export FRAME_SAMPLE_SECONDS=3
@@ -115,6 +116,7 @@ The pipeline is intentionally split into visual and publish stages:
 - Install `ffmpeg` on the backend machine if you want to use the pre-upload enhancement options such as Pop Look or Audio Cleanup.
 - Gemini's official docs currently list a free tier for the Gemini Developer API, with lower limits than paid usage.
 - If the backend returns an error on generate, check that `GEMINI_API_KEY` is set and valid.
+- `GEMINI_FALLBACK_MODELS` accepts a comma-separated list of backup Gemini model IDs. The backend will try them only when the primary model fails with quota or rate-limit errors.
 - If the YouTube publish flow fails, check that the Google OAuth client is configured and that the redirect URI in Google Cloud matches `GOOGLE_REDIRECT_URI`.
 
 ## Production deployment

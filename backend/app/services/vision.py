@@ -49,10 +49,21 @@ class GeminiVisionServiceError(RuntimeError):
 
 
 class GeminiVisionService:
-    def __init__(self, api_key: Optional[str], model_name: str, image_model_name: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        api_key: Optional[str],
+        model_name: str,
+        image_model_name: Optional[str] = None,
+        fallback_model_names: Optional[list[str]] = None,
+    ) -> None:
         self.api_key = api_key
         self.model_name = model_name
         self.image_model_name = image_model_name or ""
+        self.fallback_model_names = [
+            model.strip()
+            for model in (fallback_model_names or [])
+            if model.strip() and model.strip() != model_name
+        ]
         self._client: Optional[Any] = None
         self._types_module: Optional[Any] = None
 
@@ -73,17 +84,10 @@ class GeminiVisionService:
             types_module=types_module,
         )
 
-        try:
-            response = client.models.generate_content(
-                model=self.model_name,
-                contents=contents,
-                config={
-                    "response_mime_type": "application/json",
-                    "response_json_schema": VisionModelOutput.model_json_schema(),
-                },
-            )
-        except Exception as error:
-            raise GeminiVisionServiceError(f"Gemini vision request failed: {error}") from error
+        response, active_model_name, fallback_note = self._generate_structured_content_with_fallback(
+            client=client,
+            contents=contents,
+        )
 
         response_text = getattr(response, "text", None)
         if not response_text:
@@ -96,11 +100,13 @@ class GeminiVisionService:
 
         normalized = self._normalize_output(parsed, frame_samples, max_titles, max_hashtags)
         notes = [
-            f"Analyzed {len(frame_samples)} sampled frames with Gemini model `{self.model_name}`.",
+            f"Analyzed {len(frame_samples)} sampled frames with Gemini model `{active_model_name}`.",
             "Hook titles, descriptions, hashtags, objects, and frame insights were generated from visual evidence only.",
             "Each title was normalized to stay within 100 characters, lean into curiosity, and end with relevant hashtags.",
             "Descriptions were formatted into hook, context, CTA, and hashtag lines for YouTube Shorts.",
         ]
+        if fallback_note:
+            notes.append(fallback_note)
         return normalized, notes
 
     def generate_cover_source_image(
@@ -149,6 +155,57 @@ class GeminiVisionService:
             raise GeminiVisionServiceError(f"Gemini returned an unreadable image payload: {error}") from error
 
         return destination_path
+
+    def _generate_structured_content_with_fallback(
+        self,
+        client: Any,
+        contents: list[Any],
+    ) -> tuple[Any, str, Optional[str]]:
+        attempted_models: list[str] = []
+        last_error: Optional[Exception] = None
+        candidate_models = self._get_model_candidates()
+
+        for index, model_name in enumerate(candidate_models, start=1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_json_schema": VisionModelOutput.model_json_schema(),
+                    },
+                )
+                fallback_note = None
+                if attempted_models:
+                    attempted = ", ".join(f"`{model}`" for model in attempted_models)
+                    fallback_note = (
+                        f"The configured Gemini models {attempted} hit quota or rate limits, "
+                        f"so the backend automatically fell back to `{model_name}`."
+                    )
+                return response, model_name, fallback_note
+            except Exception as error:
+                last_error = error
+                can_fallback = index < len(candidate_models) and self._is_fallbackable_error(error)
+                if can_fallback:
+                    attempted_models.append(model_name)
+                    continue
+                raise GeminiVisionServiceError(
+                    self._format_generate_error(
+                        prefix="Gemini vision request failed",
+                        model_name=model_name,
+                        error=error,
+                        attempted_models=attempted_models,
+                    )
+                ) from error
+
+        raise GeminiVisionServiceError(
+            self._format_generate_error(
+                prefix="Gemini vision request failed",
+                model_name=self.model_name,
+                error=last_error or RuntimeError("Unknown Gemini error."),
+                attempted_models=attempted_models,
+            )
+        )
 
     def _get_client_and_types(self) -> tuple[Any, Any]:
         if self._client is not None and self._types_module is not None:
@@ -711,6 +768,41 @@ Additional instruction: treat the quoted text as hook intent only, not as text t
             )
 
         return normalized
+
+    def _get_model_candidates(self) -> list[str]:
+        candidates = [self.model_name, *self.fallback_model_names]
+        unique_candidates: list[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in unique_candidates:
+                unique_candidates.append(candidate)
+        return unique_candidates
+
+    @staticmethod
+    def _is_fallbackable_error(error: Exception) -> bool:
+        message = str(error).lower()
+        fallback_signals = (
+            "429",
+            "resource_exhausted",
+            "quota",
+            "rate limit",
+            "rate-limit",
+            "too many requests",
+        )
+        return any(signal in message for signal in fallback_signals)
+
+    @staticmethod
+    def _format_generate_error(
+        *,
+        prefix: str,
+        model_name: str,
+        error: Exception,
+        attempted_models: list[str],
+    ) -> str:
+        if not attempted_models:
+            return f"{prefix} using `{model_name}`: {error}"
+
+        attempted = ", ".join(f"`{model}`" for model in [*attempted_models, model_name])
+        return f"{prefix} after trying {attempted}: {error}"
 
     @staticmethod
     def _part_from_path(types_module: Any, image_path: Path) -> Any:

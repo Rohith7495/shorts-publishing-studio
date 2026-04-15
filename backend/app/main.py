@@ -61,6 +61,7 @@ pipeline = VideoGenerationPipeline(
     vision_service=GeminiVisionService(
         api_key=settings.gemini_api_key,
         model_name=settings.gemini_vision_model,
+        fallback_model_names=settings.gemini_fallback_models,
     ),
     max_title_count=settings.max_title_count,
     max_hashtag_count=settings.max_hashtag_count,
@@ -82,6 +83,7 @@ def healthcheck() -> dict[str, object]:
         "environment": settings.app_env,
         "gemini_configured": bool(settings.gemini_api_key),
         "vision_model": settings.gemini_vision_model,
+        "vision_fallback_models": settings.gemini_fallback_models,
         "youtube_oauth_configured": bool(settings.google_client_id and settings.google_client_secret),
     }
 
