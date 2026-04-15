@@ -12,6 +12,8 @@ from fastapi.responses import RedirectResponse
 
 from app.config import get_settings
 from app.schemas import (
+    GenerationJobStartResponse,
+    GenerationJobStatusResponse,
     GenerationResponse,
     YouTubeAuthStatus,
     YouTubePublishJobStartResponse,
@@ -51,6 +53,7 @@ youtube_oauth_service = YouTubeOAuthService(
     session_ttl_seconds=settings.oauth_session_ttl_seconds,
 )
 youtube_upload_service = YouTubeUploadService(category_id=settings.youtube_category_id)
+generation_job_store = PublishJobStore()
 publish_job_store = PublishJobStore()
 
 pipeline = VideoGenerationPipeline(
@@ -68,6 +71,7 @@ pipeline = VideoGenerationPipeline(
 def cleanup_temp_state() -> None:
     video_service.cleanup_stale_upload_sessions()
     youtube_oauth_service.cleanup_stale_sessions()
+    generation_job_store.cleanup_stale_jobs()
     publish_job_store.cleanup_stale_jobs()
 
 
@@ -96,6 +100,59 @@ async def generate_from_video(
         raise HTTPException(status_code=500, detail=str(error)) from error
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Unexpected backend error: {error}") from error
+
+
+@app.post("/api/generate/start", response_model=GenerationJobStartResponse, status_code=202)
+async def start_generate_from_video(
+    request: Request,
+    response: Response,
+    file: UploadFile = File(...),
+) -> GenerationJobStartResponse:
+    browser_session_id = _get_or_create_browser_session_id(request)
+    _set_browser_session_cookie(request, response, browser_session_id)
+
+    try:
+        stored_upload = await video_service.save_upload(file, browser_session_id)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Unexpected backend error while saving the upload: {error}") from error
+
+    job = generation_job_store.create_job(browser_session_id)
+    generation_job_store.update_job(
+        job.job_id,
+        state="queued",
+        stage="Queued",
+        detail="The upload finished and frame analysis is about to start.",
+        progress_percent=5.0,
+    )
+    Thread(
+        target=_run_generation_job,
+        args=(job.job_id, stored_upload.upload_session_id, browser_session_id),
+        daemon=True,
+    ).start()
+    return GenerationJobStartResponse(job_id=job.job_id, state="queued")
+
+
+@app.get("/api/generate/jobs/{job_id}", response_model=GenerationJobStatusResponse)
+def get_generation_job_status(job_id: str, request: Request) -> GenerationJobStatusResponse:
+    browser_session_id = request.cookies.get(settings.browser_session_cookie_name)
+    if not browser_session_id:
+        raise HTTPException(status_code=401, detail="Start a generation job before checking its status.")
+
+    job = generation_job_store.get_job(job_id, browser_session_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="The generation job was not found for this browser session.")
+
+    serialized = generation_job_store.serialize_job(job)
+    return GenerationJobStatusResponse(
+        job_id=serialized["job_id"],
+        state=serialized["state"],
+        stage=serialized["stage"],
+        detail=serialized["detail"],
+        progress_percent=serialized["progress_percent"],
+        elapsed_ms=serialized["elapsed_ms"],
+        result=serialized["result"],
+        error=serialized["error"],
+    )
 
 
 @app.delete("/api/uploads/{upload_session_id}")
@@ -269,6 +326,71 @@ def _run_publish_job(job_id: str, payload: YouTubePublishRequest, browser_sessio
     except Exception as error:
         logger.exception("Unexpected background YouTube publish failure: %s", error)
         publish_job_store.fail_job(job_id, str(error))
+
+
+def _run_generation_job(job_id: str, upload_session_id: str, browser_session_id: str) -> None:
+    upload_session = video_service.load_upload_session(upload_session_id)
+    if upload_session is None:
+        generation_job_store.fail_job(
+            job_id,
+            "The temporary upload session was lost before frame analysis could start. Generate the package again.",
+            stage="Failed",
+            detail="The uploaded file is no longer available on the backend.",
+        )
+        return
+
+    try:
+        generation_job_store.update_job(
+            job_id,
+            state="running",
+            stage="Processing video",
+            detail="Reading the uploaded file and preparing the analysis workspace.",
+            progress_percent=20.0,
+        )
+
+        result = pipeline.run_stored_upload(
+            upload_session,
+            stage_callback=lambda stage, detail, progress_percent: generation_job_store.update_job(
+                job_id,
+                state="running",
+                stage=stage,
+                detail=detail,
+                progress_percent=progress_percent,
+            ),
+        )
+        generation_job_store.complete_job(
+            job_id,
+            result.model_dump(mode="json"),
+            stage="Complete",
+            detail="The YouTube package is ready to review and publish.",
+        )
+    except GeminiVisionServiceError as error:
+        logger.exception("Background generation failed: %s", error)
+        generation_job_store.fail_job(
+            job_id,
+            str(error),
+            stage="Failed",
+            detail="The AI generation step did not complete successfully.",
+        )
+        video_service.delete_upload_session(upload_session_id)
+    except VideoProcessingServiceError as error:
+        logger.exception("Background video processing failed: %s", error)
+        generation_job_store.fail_job(
+            job_id,
+            str(error),
+            stage="Failed",
+            detail="The backend could not finish processing the uploaded video.",
+        )
+        video_service.delete_upload_session(upload_session_id)
+    except Exception as error:
+        logger.exception("Unexpected background generation failure: %s", error)
+        generation_job_store.fail_job(
+            job_id,
+            f"Unexpected backend error: {error}",
+            stage="Failed",
+            detail="The generation workflow stopped unexpectedly.",
+        )
+        video_service.delete_upload_session(upload_session_id)
 
 
 def _validate_publish_prerequisites(payload: YouTubePublishRequest, browser_session_id: str) -> None:

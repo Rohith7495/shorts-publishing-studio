@@ -71,6 +71,22 @@ class YouTubeAuthStatus(BaseModel):
     channel_id: Optional[str] = None
 
 
+class GenerationJobStartResponse(BaseModel):
+    job_id: str
+    state: Literal["queued", "running", "succeeded", "failed"]
+
+
+class GenerationJobStatusResponse(BaseModel):
+    job_id: str
+    state: Literal["queued", "running", "succeeded", "failed"]
+    stage: str
+    detail: Optional[str] = None
+    progress_percent: Optional[float] = None
+    elapsed_ms: int
+    result: Optional[GenerationResponse] = None
+    error: Optional[str] = None
+
+
 class VideoEnhancementOptions(BaseModel):
     visual_pop: bool = False
     audio_cleanup: bool = False

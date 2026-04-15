@@ -4,6 +4,8 @@ import { FormEvent, useEffect, useState, useTransition } from "react";
 
 import { API_BASE_URL } from "@/lib/api";
 import type {
+  GenerationJobStartResponse,
+  GenerationJobStatusResponse,
   GenerationResponse,
   YouTubeAuthStatus,
   YouTubePublishJobStartResponse,
@@ -31,14 +33,39 @@ const GENERATION_STAGES = [
     detail: "Sending the video from your browser to the live backend.",
   },
   {
+    label: "Processing video",
+    detail: "Reading the uploaded file and preparing the analysis workspace.",
+  },
+  {
     label: "Extracting frames",
-    detail: "Sampling key frames and reading video metadata.",
+    detail: "Sampling key frames and gathering video metadata.",
   },
   {
     label: "Asking Gemini",
     detail: "Generating titles, descriptions, hashtags, and first comment ideas.",
   },
+  {
+    label: "Finalizing package",
+    detail: "Preparing the final package response for review.",
+  },
 ] as const;
+
+function getGenerationStageIndex(stage?: string | null) {
+  if (!stage || stage === "Queued") {
+    return 0;
+  }
+
+  const stageIndex = GENERATION_STAGES.findIndex((item) => item.label === stage);
+  if (stageIndex >= 0) {
+    return stageIndex;
+  }
+
+  if (stage === "Complete") {
+    return GENERATION_STAGES.length - 1;
+  }
+
+  return 0;
+}
 
 function formatDateTimeLocalInput(date: Date) {
   const year = date.getFullYear();
@@ -56,6 +83,8 @@ function defaultScheduledAtValue() {
 export function UploadStudio() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [results, setResults] = useState<GenerationResponse | null>(null);
+  const [generationJobId, setGenerationJobId] = useState<string | null>(null);
+  const [generationJobStatus, setGenerationJobStatus] = useState<GenerationJobStatusResponse | null>(null);
   const [authStatus, setAuthStatus] = useState<YouTubeAuthStatus>(DEFAULT_AUTH_STATUS);
   const [publishResult, setPublishResult] = useState<YouTubePublishResponse | null>(null);
   const [publishJobId, setPublishJobId] = useState<string | null>(null);
@@ -89,23 +118,7 @@ export function UploadStudio() {
   }, []);
 
   useEffect(() => {
-    if (!isSubmitting) {
-      return;
-    }
-
-    setGenerationStageIndex(0);
-    const timers = [
-      window.setTimeout(() => setGenerationStageIndex((current) => Math.max(current, 1)), 900),
-      window.setTimeout(() => setGenerationStageIndex((current) => Math.max(current, 2)), 2200),
-    ];
-
-    return () => {
-      timers.forEach((timer) => window.clearTimeout(timer));
-    };
-  }, [isSubmitting]);
-
-  useEffect(() => {
-    if (generationStartedAt === null || !isSubmitting) {
+    if (generationStartedAt === null || (!isSubmitting && generationJobId === null)) {
       return;
     }
 
@@ -116,7 +129,94 @@ export function UploadStudio() {
     updateElapsed();
     const interval = window.setInterval(updateElapsed, 250);
     return () => window.clearInterval(interval);
-  }, [generationStartedAt, isSubmitting]);
+  }, [generationJobId, generationStartedAt, isSubmitting]);
+
+  useEffect(() => {
+    if (!generationJobId) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const pollGenerationJob = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/generate/jobs/${generationJobId}`, {
+          credentials: "include",
+        });
+
+        if (!response.ok) {
+          let backendMessage = `Generation status failed with ${response.status}.`;
+          try {
+            const errorPayload = (await response.json()) as { detail?: string };
+            if (errorPayload.detail) {
+              backendMessage = errorPayload.detail;
+            }
+          } catch {
+            // Keep generic message if the backend did not return JSON.
+          }
+          throw new Error(backendMessage);
+        }
+
+        const payload = (await response.json()) as GenerationJobStatusResponse;
+        if (cancelled) {
+          return;
+        }
+
+        setGenerationJobStatus(payload);
+        setGenerationStageIndex(getGenerationStageIndex(payload.stage));
+        setGenerationDisplayElapsedMs(payload.elapsed_ms);
+
+        if (payload.state === "succeeded" && payload.result) {
+          startTransition(() => {
+            setResults(payload.result ?? null);
+            if (payload.result) {
+              applySuggestedMetadata(payload.result);
+            }
+          });
+          setGenerationElapsedMs(payload.elapsed_ms);
+          setGenerationDisplayElapsedMs(payload.elapsed_ms);
+          setGenerationJobId(null);
+          window.setTimeout(() => setShowGenerationProgress(false), 350);
+          return;
+        }
+
+        if (payload.state === "failed") {
+          setGenerationElapsedMs(payload.elapsed_ms);
+          setGenerationDisplayElapsedMs(payload.elapsed_ms);
+          setGenerationJobId(null);
+          setShowGenerationProgress(false);
+          setError(payload.error ?? "Something went wrong while generating the YouTube package.");
+          return;
+        }
+
+        timeoutId = window.setTimeout(() => {
+          void pollGenerationJob();
+        }, 1000);
+      } catch (pollError) {
+        if (cancelled) {
+          return;
+        }
+
+        setGenerationJobId(null);
+        setShowGenerationProgress(false);
+        setError(
+          pollError instanceof Error
+            ? pollError.message
+            : "Something went wrong while checking generation status.",
+        );
+      }
+    };
+
+    void pollGenerationJob();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [generationJobId, startTransition]);
 
   useEffect(() => {
     if (!publishJobId || !isPublishing) {
@@ -276,6 +376,8 @@ export function UploadStudio() {
     setPublishResult(null);
     setShowGenerationProgress(true);
     setGenerationStageIndex(0);
+    setGenerationJobId(null);
+    setGenerationJobStatus(null);
     const startedAt = Date.now();
     setGenerationStartedAt(startedAt);
     setGenerationElapsedMs(null);
@@ -287,7 +389,7 @@ export function UploadStudio() {
       const formData = new FormData();
       formData.append("file", selectedFile);
 
-      const response = await fetch(`${API_BASE_URL}/api/generate`, {
+      const response = await fetch(`${API_BASE_URL}/api/generate/start`, {
         method: "POST",
         body: formData,
         credentials: "include",
@@ -306,15 +408,18 @@ export function UploadStudio() {
         throw new Error(backendMessage);
       }
 
-      const payload = (await response.json()) as GenerationResponse;
-      startTransition(() => {
-        setResults(payload);
-        applySuggestedMetadata(payload);
+      const payload = (await response.json()) as GenerationJobStartResponse;
+      setGenerationJobId(payload.job_id);
+      setGenerationJobStatus({
+        job_id: payload.job_id,
+        state: payload.state,
+        stage: "Queued",
+        detail: "The upload finished and frame analysis is about to start.",
+        progress_percent: 5.0,
+        elapsed_ms: Date.now() - startedAt,
+        result: null,
+        error: null,
       });
-      const totalElapsed = Date.now() - startedAt;
-      setGenerationElapsedMs(totalElapsed);
-      setGenerationDisplayElapsedMs(totalElapsed);
-      window.setTimeout(() => setShowGenerationProgress(false), 350);
       setPublishJobId(null);
       setPublishJobStatus(null);
       setPublishElapsedMs(null);
@@ -357,6 +462,8 @@ export function UploadStudio() {
 
     setSelectedFile(file);
     setResults(null);
+    setGenerationJobId(null);
+    setGenerationJobStatus(null);
     setPublishResult(null);
     setPublishJobId(null);
     setPublishJobStatus(null);
@@ -657,6 +764,7 @@ export function UploadStudio() {
     descriptionDraft.trim().length > 0 &&
     (publishMode !== "scheduled" || scheduleAtDraft.trim().length > 0) &&
     (!postFirstComment || firstCommentDraft.trim().length > 0);
+  const isGenerating = isSubmitting || generationJobId !== null;
 
   return (
     <main className="page-shell">
@@ -781,17 +889,24 @@ export function UploadStudio() {
               </div>
               <p className="section-caption">
                 {isSubmitting
-                  ? "The live backend is still working through the current stage."
-                  : "Finalizing the package response."}
+                  ? "Uploading the video to the backend before analysis starts."
+                  : generationJobStatus?.detail
+                    ? generationJobStatus.detail
+                    : "Finalizing the package response."}
               </p>
+              {generationJobStatus?.progress_percent != null && !isSubmitting ? (
+                <p className="section-caption">
+                  Progress: {generationJobStatus.progress_percent.toFixed(0)}%
+                </p>
+              ) : null}
               <p className="section-caption">
                 Elapsed time: {formatElapsedTime(generationDisplayElapsedMs)}
               </p>
             </div>
           ) : null}
 
-          <button className="primary-button" type="submit" disabled={isSubmitting || isPending}>
-            {isSubmitting || isPending ? "Generating package..." : "Generate YouTube Package"}
+          <button className="primary-button" type="submit" disabled={isGenerating || isPending}>
+            {isGenerating || isPending ? "Generating package..." : "Generate YouTube Package"}
           </button>
         </form>
 
@@ -823,7 +938,7 @@ export function UploadStudio() {
                 <button
                   type="button"
                   className="secondary-button"
-                  disabled={isSubmitting || isPending || !selectedFile}
+                  disabled={isGenerating || isPending || !selectedFile}
                   onClick={() => void runGeneration()}
                 >
                   Regenerate

@@ -50,6 +50,22 @@ export type YouTubeAuthStatus = {
   channel_id?: string | null;
 };
 
+export type GenerationJobStartResponse = {
+  job_id: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+};
+
+export type GenerationJobStatusResponse = {
+  job_id: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+  stage: string;
+  detail?: string | null;
+  progress_percent?: number | null;
+  elapsed_ms: number;
+  result?: GenerationResponse | null;
+  error?: string | null;
+};
+
 export type YouTubePublishResponse = {
   video_id: string;
   video_url: string;

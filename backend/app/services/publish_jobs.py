@@ -80,28 +80,42 @@ class PublishJobStore:
             record.remaining_seconds = remaining_seconds
             record.updated_at = datetime.now(timezone.utc)
 
-    def complete_job(self, job_id: str, result: dict[str, Any]) -> None:
+    def complete_job(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        *,
+        stage: str = "Complete",
+        detail: str = "The workflow finished successfully.",
+    ) -> None:
         with self._lock:
             record = self._jobs.get(job_id)
             if record is None:
                 return
             record.state = "succeeded"
-            record.stage = "Complete"
-            record.detail = "The YouTube upload workflow finished successfully."
+            record.stage = stage
+            record.detail = detail
             record.progress_percent = 100.0
             record.remaining_seconds = 0.0
             record.result = result
             record.error = None
             record.updated_at = datetime.now(timezone.utc)
 
-    def fail_job(self, job_id: str, error: str) -> None:
+    def fail_job(
+        self,
+        job_id: str,
+        error: str,
+        *,
+        stage: str = "Failed",
+        detail: str = "The workflow stopped before completion.",
+    ) -> None:
         with self._lock:
             record = self._jobs.get(job_id)
             if record is None:
                 return
             record.state = "failed"
-            record.stage = "Failed"
-            record.detail = "The YouTube upload workflow stopped before completion."
+            record.stage = stage
+            record.detail = detail
             record.error = error
             record.remaining_seconds = None
             record.updated_at = datetime.now(timezone.utc)
