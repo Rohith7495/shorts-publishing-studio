@@ -21,6 +21,7 @@ from app.schemas import (
     YouTubePublishRequest,
     YouTubePublishResponse,
 )
+from app.services.deferred_comments import DeferredCommentQueue
 from app.services.pipeline import VideoGenerationPipeline
 from app.services.publish_jobs import PublishJobStore
 from app.services.video import VideoProcessingService, VideoProcessingServiceError
@@ -53,6 +54,12 @@ youtube_oauth_service = YouTubeOAuthService(
     session_ttl_seconds=settings.oauth_session_ttl_seconds,
 )
 youtube_upload_service = YouTubeUploadService(category_id=settings.youtube_category_id)
+deferred_comment_queue = DeferredCommentQueue(
+    queue_dir=settings.pending_comment_dir,
+    poll_seconds=settings.pending_comment_poll_seconds,
+    oauth_service=youtube_oauth_service,
+    youtube_upload_service=youtube_upload_service,
+)
 generation_job_store = PublishJobStore()
 publish_job_store = PublishJobStore()
 
@@ -72,8 +79,15 @@ pipeline = VideoGenerationPipeline(
 def cleanup_temp_state() -> None:
     video_service.cleanup_stale_upload_sessions()
     youtube_oauth_service.cleanup_stale_sessions()
+    deferred_comment_queue.cleanup()
+    deferred_comment_queue.start()
     generation_job_store.cleanup_stale_jobs()
     publish_job_store.cleanup_stale_jobs()
+
+
+@app.on_event("shutdown")
+def stop_background_workers() -> None:
+    deferred_comment_queue.stop()
 
 
 @app.get("/health")
@@ -507,15 +521,10 @@ def _run_publish_workflow(
 
     publish_notes: list[str] = [*preparation_notes]
     first_comment_posted = False
+    first_comment_queued = False
     first_comment_id: Optional[str] = None
 
     first_comment_supported = payload.privacy_status in {"public", "unlisted"} and payload.publish_at is None
-
-    if payload.post_first_comment and payload.first_comment_text and not first_comment_supported:
-        publish_notes.append(
-            "Skipped automatic first comment because YouTube only allows it after the video is visible "
-            "publicly or as unlisted. Private and scheduled uploads cannot receive comments yet."
-        )
 
     if payload.post_first_comment and payload.first_comment_text and first_comment_supported:
         try:
@@ -535,6 +544,29 @@ def _run_publish_workflow(
             publish_notes.append("Posted the first comment automatically after upload.")
         except YouTubeServiceError as error:
             publish_notes.append(str(error))
+    elif payload.post_first_comment and payload.first_comment_text:
+        if job_id is not None:
+            publish_job_store.update_job(
+                job_id,
+                state="running",
+                stage="Queueing first comment",
+                detail="Saving the first comment so the backend can post it when YouTube allows comments.",
+            )
+        deferred_comment_queue.enqueue(
+            browser_session_id=browser_session_id,
+            video_id=publish_result["video_id"],
+            text=payload.first_comment_text,
+            publish_at=payload.publish_at,
+        )
+        first_comment_queued = True
+        if payload.publish_at is not None:
+            publish_notes.append(
+                "Queued the first comment. The backend will try to post it automatically after the scheduled publish time."
+            )
+        else:
+            publish_notes.append(
+                "Queued the first comment. The backend will keep retrying and post it automatically after this private video becomes public or unlisted."
+            )
 
     if job_id is not None:
         publish_job_store.update_job(
@@ -552,6 +584,7 @@ def _run_publish_workflow(
         privacy_status=payload.privacy_status,
         publish_at=payload.publish_at,
         first_comment_posted=first_comment_posted,
+        first_comment_queued=first_comment_queued,
         first_comment_id=first_comment_id,
         deleted_local_upload=deleted_local_upload,
         applied_enhancements=applied_enhancements,

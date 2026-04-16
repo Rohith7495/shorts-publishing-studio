@@ -42,11 +42,6 @@ class DescriptionCandidate(BaseModel):
     angle: str
 
 
-class CoverTextCandidate(BaseModel):
-    text: str
-    score: float
-
-
 class VisionModelOutput(BaseModel):
     category: str
     visual_basis: str
@@ -141,6 +136,7 @@ class YouTubePublishResponse(BaseModel):
     privacy_status: Literal["private", "unlisted", "public"]
     publish_at: Optional[datetime] = None
     first_comment_posted: bool = False
+    first_comment_queued: bool = False
     first_comment_id: Optional[str] = None
     deleted_local_upload: bool
     applied_enhancements: list[str] = Field(default_factory=list)

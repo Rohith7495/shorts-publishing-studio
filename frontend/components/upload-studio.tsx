@@ -80,6 +80,26 @@ function defaultScheduledAtValue() {
   return formatDateTimeLocalInput(new Date(Date.now() + 60 * 60 * 1000));
 }
 
+function getAuthStatusLabel(authStatus: YouTubeAuthStatus, isCheckingAuth: boolean) {
+  if (isCheckingAuth) {
+    return "Checking connection...";
+  }
+  if (!authStatus.connected) {
+    return "Not connected";
+  }
+  return authStatus.channel_title ?? "Connected (channel name unavailable)";
+}
+
+function getAuthStatusDescription(authStatus: YouTubeAuthStatus) {
+  if (!authStatus.connected) {
+    return "Sign in with Google to allow this app to upload to your YouTube channel.";
+  }
+  if (authStatus.channel_title) {
+    return `Connected in this browser session as ${authStatus.channel_title}.`;
+  }
+  return "Connected in this browser session, but the channel name could not be loaded yet.";
+}
+
 export function UploadStudio() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [results, setResults] = useState<GenerationResponse | null>(null);
@@ -765,6 +785,8 @@ export function UploadStudio() {
     (publishMode !== "scheduled" || scheduleAtDraft.trim().length > 0) &&
     (!postFirstComment || firstCommentDraft.trim().length > 0);
   const isGenerating = isSubmitting || generationJobId !== null;
+  const authStatusLabel = getAuthStatusLabel(authStatus, isCheckingAuth);
+  const authStatusDescription = getAuthStatusDescription(authStatus);
 
   return (
     <main className="page-shell">
@@ -787,13 +809,7 @@ export function UploadStudio() {
         <div className="hero-panel">
           <div className="stat-card">
             <span className="stat-label">YouTube status</span>
-            <strong>
-              {isCheckingAuth
-                ? "Checking connection..."
-                : authStatus.connected
-                  ? authStatus.channel_title ?? "Connected"
-                  : "Not connected"}
-            </strong>
+            <strong>{authStatusLabel}</strong>
           </div>
           <div className="stat-card">
             <span className="stat-label">Current file</span>
@@ -815,11 +831,7 @@ export function UploadStudio() {
 
           <div className="info-card">
             <h3>YouTube Connection</h3>
-            <p>
-              {authStatus.connected
-                ? `Connected in this browser session${authStatus.channel_title ? ` as ${authStatus.channel_title}` : ""}.`
-                : "Sign in with Google to allow this app to upload to your YouTube channel."}
-            </p>
+            <p>{authStatusDescription}</p>
             <div className="action-row">
               <button
                 type="button"
@@ -1025,6 +1037,15 @@ export function UploadStudio() {
                   <p className="section-caption">
                     Auto-post the first comment right after upload. You can pin it manually later in YouTube Studio.
                   </p>
+                  {publishMode === "scheduled" ? (
+                    <p className="section-caption">
+                      Scheduled uploads will queue the first comment and post it automatically after the video becomes visible.
+                    </p>
+                  ) : publishMode === "private" ? (
+                    <p className="section-caption">
+                      Private uploads will queue the first comment and keep retrying until you later change the video to public or unlisted.
+                    </p>
+                  ) : null}
                   <label className="checkbox-row">
                     <input
                       type="checkbox"
@@ -1179,7 +1200,15 @@ export function UploadStudio() {
                     {publishElapsedMs != null ? (
                       <p>Total publish time: {formatElapsedTime(publishElapsedMs)}</p>
                     ) : null}
-                    <p>First comment: {publishResult.first_comment_posted ? "posted" : "not posted"}.</p>
+                    <p>
+                      First comment:{" "}
+                      {publishResult.first_comment_posted
+                        ? "posted"
+                        : publishResult.first_comment_queued
+                          ? "queued for automatic posting"
+                          : "not posted"}
+                      .
+                    </p>
                     {publishResult.publish_notes.length > 0 ? (
                       <ul className="notes-list">
                         {publishResult.publish_notes.map((note) => (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,8 @@ from urllib.parse import urlparse
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 YOUTUBE_READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
 YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
+
+logger = logging.getLogger(__name__)
 
 
 class YouTubeServiceError(RuntimeError):
@@ -88,6 +91,10 @@ class YouTubeOAuthService:
             payload = youtube.channels().list(part="snippet", mine=True).execute()
             items = payload.get("items") or []
             if not items:
+                logger.warning(
+                    "YouTube auth status lookup returned no channels for browser session %s.",
+                    browser_session_id[:8],
+                )
                 return {"connected": True, "channel_title": None, "channel_id": None}
 
             first_item = items[0]
@@ -98,6 +105,10 @@ class YouTubeOAuthService:
                 "channel_id": first_item.get("id"),
             }
         except Exception:
+            logger.exception(
+                "YouTube auth status lookup failed for browser session %s.",
+                browser_session_id[:8],
+            )
             return {"connected": True, "channel_title": None, "channel_id": None}
 
     def get_credentials(self, browser_session_id: str) -> Optional[Any]:
@@ -369,6 +380,24 @@ class YouTubeUploadService:
         if not comment_id:
             raise YouTubeServiceError("YouTube did not return a comment ID after posting the first comment.")
         return str(comment_id)
+
+    def get_video_privacy_status(self, credentials: Any, video_id: str) -> str:
+        build, _ = self._import_youtube_client_modules()
+        youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
+
+        try:
+            response = youtube.videos().list(part="status", id=video_id).execute()
+        except Exception as error:
+            raise YouTubeServiceError(f"Unable to fetch YouTube video status: {error}") from error
+
+        items = response.get("items") or []
+        if not items:
+            raise YouTubeServiceError("YouTube did not return the uploaded video while checking comment readiness.")
+
+        status = (items[0].get("status") or {}).get("privacyStatus")
+        if not status:
+            raise YouTubeServiceError("YouTube did not return a privacy status for the uploaded video.")
+        return str(status)
 
     @staticmethod
     def _normalize_tags(tags: list[str]) -> list[str]:

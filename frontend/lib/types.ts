@@ -73,6 +73,7 @@ export type YouTubePublishResponse = {
   privacy_status: "private" | "unlisted" | "public";
   publish_at?: string | null;
   first_comment_posted: boolean;
+  first_comment_queued: boolean;
   first_comment_id?: string | null;
   deleted_local_upload: boolean;
   applied_enhancements?: string[];

@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Union
+from typing import Annotated, Optional, Union
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -16,9 +16,11 @@ class Settings(BaseSettings):
     app_env: str = "development"
     video_upload_dir: Path = Path("storage/uploads")
     oauth_session_dir: Path = Path("storage/oauth_sessions")
+    pending_comment_dir: Path = Path("storage/pending_comments")
     frame_sample_seconds: int = Field(default=3, ge=1, le=30)
     upload_session_ttl_seconds: int = Field(default=3600, ge=300, le=86400)
     oauth_session_ttl_seconds: int = Field(default=2592000, ge=3600, le=7776000)
+    pending_comment_poll_seconds: int = Field(default=30, ge=10, le=3600)
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
     max_title_count: int = Field(default=2, ge=1, le=10)
     max_hashtag_count: int = Field(default=15, ge=3, le=30)
@@ -28,7 +30,7 @@ class Settings(BaseSettings):
     browser_session_cookie_secure: bool = False
     gemini_api_key: Optional[str] = None
     gemini_vision_model: str = "gemini-2.5-flash-lite"
-    gemini_fallback_models: list[str] = Field(default_factory=list)
+    gemini_fallback_models: Annotated[list[str], NoDecode] = Field(default_factory=list)
     google_client_id: Optional[str] = None
     google_client_secret: Optional[str] = None
     google_redirect_uri: str = "http://localhost:8000/api/auth/youtube/callback"
@@ -95,4 +97,5 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.video_upload_dir.mkdir(parents=True, exist_ok=True)
     settings.oauth_session_dir.mkdir(parents=True, exist_ok=True)
+    settings.pending_comment_dir.mkdir(parents=True, exist_ok=True)
     return settings
