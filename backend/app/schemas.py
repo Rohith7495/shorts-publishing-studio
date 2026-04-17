@@ -42,6 +42,11 @@ class DescriptionCandidate(BaseModel):
     angle: str
 
 
+class CoverTextCandidate(BaseModel):
+    text: str
+    score: float
+
+
 class VisionModelOutput(BaseModel):
     category: str
     visual_basis: str

@@ -1,5 +1,5 @@
 from app.prompts import build_visual_user_prompt
-from app.schemas import FrameSample, HookTitleCandidate
+from app.schemas import CoverTextCandidate, FrameSample, HookTitleCandidate
 from app.services.vision import GeminiVisionService
 
 
@@ -73,3 +73,10 @@ def test_description_normalization_formats_multiline_shorts_copy() -> None:
     assert len(lines) == 4
     assert lines[-1].startswith("#")
     assert "#shorts" in lines[-1]
+
+
+def test_cover_text_candidate_schema_remains_available_for_vision_compatibility() -> None:
+    candidate = CoverTextCandidate(text="WAIT FOR IT", score=8.7)
+
+    assert candidate.text == "WAIT FOR IT"
+    assert candidate.score == 8.7
